@@ -1422,15 +1422,15 @@ uri_dec() {
 
 # 解析 hysteria2:// 链接，结果写进 P_* 全局变量
 parse_uri() {
-  local u="${1:-}" frag="" q="" userinfo="" hostport="" kvp k v oldifs="$IFS"
+  local u="${1:-}" q="" userinfo="" hostport="" kvp k v oldifs="$IFS"
   P_PWD=""; P_HOST=""; P_PORT="443"; P_SNI=""; P_INSECURE=""; P_PIN=""
-  P_OBFSTYPE=""; P_OBFSPWD=""; P_MPORT=""; P_NAME=""
+  P_OBFSTYPE=""; P_OBFSPWD=""; P_MPORT=""
 
   case "$u" in
     hysteria2://*|hy2://*) u="${u#*://}" ;;
     *) return 1 ;;
   esac
-  case "$u" in *"#"*) frag="${u#*#}"; u="${u%%#*}" ;; esac
+  case "$u" in *"#"*) u="${u%%#*}" ;; esac          # 丢掉 #备注，链接名不参与转发
   case "$u" in *"?"*) q="${u#*\?}"; u="${u%%\?*}" ;; esac
 
   if [[ "$u" == *@* ]]; then
@@ -1442,7 +1442,6 @@ parse_uri() {
   hostport="${hostport%%/*}"
 
   P_PWD="$(uri_dec "$userinfo")"
-  P_NAME="$(uri_dec "$frag")"
 
   if [[ "$hostport" == \[* ]]; then
     # [IPv6]:port
@@ -1889,7 +1888,7 @@ relay_add_interactive() {
     P_PWD="$pw"; P_HOST="$h"; P_PORT="$p"; P_SNI="$sni"
     P_OBFSTYPE=""; [ -n "$ob" ] && P_OBFSTYPE="salamander"
     P_OBFSPWD="$ob"; P_PIN=""; P_INSECURE="1"
-    P_MPORT=""; P_NAME=""
+    P_MPORT=""
     URI_RAW=""
   fi
 
