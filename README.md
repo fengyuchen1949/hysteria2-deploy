@@ -55,8 +55,8 @@ git clone https://github.com/fengyuchen1949/hysteria2-deploy.git
 
 ```
 ▸ 1/6  客户端连接地址
-[*] 检测到公网 IP：203.0.113.10
-? 域名或 IP（回车使用 203.0.113.10）:
+[*] 检测到公网 IP：YOUR_SERVER_IP
+? 域名或 IP（回车使用 YOUR_SERVER_IP）:
 
 ▸ 2/6  监听端口
    Hysteria2 走 UDP。部分机房对 443 有 QoS，可改 8443 / 2096 等
@@ -88,7 +88,7 @@ git clone https://github.com/fengyuchen1949/hysteria2-deploy.git
 ------------------------------------------------------------
  即将执行
 ------------------------------------------------------------
- 连接地址      203.0.113.10
+ 连接地址      YOUR_SERVER_IP
  端口          443/udp
  证书          自签（pinSHA256）
  密码          a3f9c1d2e4b5...
@@ -109,7 +109,7 @@ bash install.sh --yes
 bash install.sh --domain hy.example.com --email me@example.com --yes
 
 # 自定义：端口 8443、固定密码、关混淆
-bash install.sh --host 203.0.113.10 --port 8443 \
+bash install.sh --host YOUR_SERVER_IP --port 8443 \
   --password 'MyStrongPass' --no-obfs --yes
 
 # 锁定 Hysteria 版本
@@ -205,19 +205,19 @@ bash install.sh --masquerade https://www.example.com/   # 手动
 **Hysteria2 分享链接**
 
 ```
-hysteria2://密码@203.0.113.10:443/?sni=203.0.113.10&insecure=1&obfs=salamander&obfs-password=xxx#HY2-203.0.113.10
+hysteria2://密码@YOUR_SERVER_IP:443/?sni=YOUR_SERVER_IP&insecure=1&obfs=salamander&obfs-password=xxx#HY2-YOUR_SERVER_IP
 ```
 
 **Clash Meta / mihomo**
 
 ```yaml
 proxies:
-  - name: "HY2-203.0.113.10"
+  - name: "HY2-YOUR_SERVER_IP"
     type: hysteria2
-    server: 203.0.113.10
+    server: YOUR_SERVER_IP
     port: 443
     password: "xxx"
-    sni: 203.0.113.10
+    sni: YOUR_SERVER_IP
     skip-cert-verify: true
     obfs: salamander
     obfs-password: "xxx"
@@ -231,10 +231,10 @@ proxies:
 {
   "type": "hysteria2",
   "tag": "hy2",
-  "server": "203.0.113.10",
+  "server": "YOUR_SERVER_IP",
   "server_port": 443,
   "password": "xxx",
-  "tls": { "enabled": true, "server_name": "203.0.113.10", "insecure": true, "alpn": ["h3"] },
+  "tls": { "enabled": true, "server_name": "YOUR_SERVER_IP", "insecure": true, "alpn": ["h3"] },
   "obfs": { "type": "salamander", "password": "xxx" },
   "up_mbps": 50,
   "down_mbps": 200
