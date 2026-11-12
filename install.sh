@@ -6,24 +6,31 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.0.4
+#  脚本版本：1.1.0
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
 #    bash install.sh --yes                    # 全默认，零交互
 #    bash install.sh --domain a.com --email me@a.com --yes
+#    bash install.sh menu                     # 管理菜单（装好后直接敲 hy）
 #    bash install.sh info | status | log | restart | upgrade | uninstall
+#    bash install.sh relay add --link 'hysteria2://...' --listen 20001 --name hk
 #
 #  在线执行：
 #    bash <(curl -fsSL https://raw.githubusercontent.com/<你>/<仓库>/main/install.sh)
 #
 #  脚本只会改动这些路径：
 #    /usr/local/bin/hysteria
+#    /usr/local/bin/hy2  /usr/local/bin/hy        （管理命令，装好后直接敲 hy）
 #    /etc/hysteria/{config.yaml,cert.pem,key.pem,.install.meta}
+#    /etc/hy2-relay/{nodes/*.conf,apply.sh,clear.sh}   （中转规则，纯 iptables）
 #    /etc/systemd/system/hysteria-server.service   （systemd）
 #    /etc/init.d/hysteria-server                   （OpenRC）
+#    /etc/systemd/system/hy2-relay.service         （systemd，有转发时）
+#    /etc/init.d/hy2-relay                         （OpenRC，有转发时）
 #    /var/log/hysteria.log                         （OpenRC 下的输出日志）
 #    /etc/sysctl.d/99-hysteria.conf
+#    /etc/sysctl.d/99-hy2-relay.conf               （有转发时）
 # ==============================================================================
 
 set -Eeuo pipefail
@@ -34,7 +41,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-SCRIPT_VERSION="1.0.4"
+SCRIPT_VERSION="1.1.0"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -46,6 +53,22 @@ INIT_SYS=""                 # systemd / openrc / none
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria.conf"
 SVC="hysteria-server"
 LOG_FILE="/var/log/hysteria.log"   # OpenRC 下的输出日志
+
+# 中转（转发）相关
+RELAY_DIR="/etc/hy2-relay"
+RELAY_NODES="${RELAY_DIR}/nodes"
+RELAY_APPLY="${RELAY_DIR}/apply.sh"
+RELAY_CLEAR="${RELAY_DIR}/clear.sh"
+RELAY_SYSCTL="/etc/sysctl.d/99-hy2-relay.conf"
+RELAY_SVC="hy2-relay"
+SYSTEMD_DIR="${SYSTEMD_DIR:-/etc/systemd/system}"
+OPENRC_DIR="${OPENRC_DIR:-/etc/init.d}"
+RELAY_RULE_COUNT=0
+MENU_IP=""
+
+# 自更新用：hy 命令第一次由这个地址拿脚本，之后本机就有副本了
+SELF_URL="${SELF_URL:-https://raw.githubusercontent.com/fengyuchen1949/hysteria2-deploy/main/install.sh}"
+CLI_BIN="/usr/local/bin/hy2"
 
 PORT="${PORT:-443}"
 DOMAIN=""
@@ -68,6 +91,13 @@ TUNE=1
 ASSUME_YES=0
 FORCE=0
 ACTION="install"
+SUB=()                      # relay 后面的子命令与位置参数
+RELAY_LINK=""
+RELAY_NAME=""
+RELAY_NOTE=""
+RELAY_LISTEN_ARG=""
+URI_RAW=""                  # 落地机原始链接，便于排错时回溯
+PICK_NAME=""
 
 # ------------------------------ 输出样式 ------------------------------
 # 颜色必须用 $'\e[..m' 定义成真实 ESC 字节。
@@ -230,8 +260,18 @@ Hysteria2 一键部署脚本（systemd / OpenRC）
 
 命令（默认 install）：
   install        安装 / 重装
+  menu           管理菜单（装好后直接敲 hy 即可进入）
   info           打印节点信息与分享链接
   masq [值]      只换伪装站点：auto / random / none / <URL>，不动密码与证书
+  relay ...      中转转发（落地机不动，中转机只做 UDP 转发）
+      add --link <落地机链接> [--listen 端口] [--name 名字] [--note 备注]
+      list [--links]          规则列表 / 连链接一起打印
+      link <名字>             只打印这条中转链接
+      edit <名字>             改监听端口 / 备注 / 启停
+      del <名字>              删除（只删本机规则，不动落地机）
+      enable|disable <名字>   启停
+      apply | clear           重新下发 / 清空全部规则
+      diag                    链路自检（规则命中计数）
   status         查看服务状态
   log            查看实时日志
   restart        重启服务
@@ -262,6 +302,10 @@ Hysteria2 一键部署脚本（systemd / OpenRC）
   --yes, -y              零交互
   --force                已安装时直接覆盖
   -h, --help             帮助
+
+中转是纯 iptables 的 UDP DNAT + MASQUERADE：不装 Hysteria、不起额外进程，
+规则写进自定义链 HY2R_PRE / HY2R_POST，并生成开机自启服务。落地机全程不用改。
+Hysteria2 走的 QUIC 是 UDP，所以中转机只需放行 UDP 端口，TCP 不用管。
 EOF
 }
 
@@ -269,6 +313,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     install|info|status|log|restart|upgrade|uninstall) ACTION="$1"; shift ;;
     masq)            ACTION="masq"; shift ;;
+    menu|m)          ACTION="menu"; shift ;;
+    relay)           ACTION="relay"; shift ;;
+    --link)          RELAY_LINK="${2:-}"; shift 2 ;;
+    --listen)        RELAY_LISTEN_ARG="${2:-}"; shift 2 ;;
+    --name)          RELAY_NAME="${2:-}"; shift 2 ;;
+    --note)          RELAY_NOTE="${2:-}"; shift 2 ;;
     --domain)        DOMAIN="${2:-}"; MODE="acme"; MODE_SET=1; shift 2 ;;
     --email)         EMAIL="${2:-}"; shift 2 ;;
     --ip|--selfsigned) MODE="selfsigned"; MODE_SET=1; shift ;;
@@ -293,13 +343,20 @@ while [ $# -gt 0 ]; do
     -*) die "未知参数：$1（--help 查看帮助）" ;;
     *)  # masq 后面可以直接跟值：masq auto / masq none / masq https://...
       if [ "$ACTION" = "masq" ]; then set_masq "$1"; shift
+      elif [ "$ACTION" = "relay" ]; then
+        case "$1" in -*) die "未知参数：$1（--help 查看帮助）" ;; esac
+        SUB+=("$1"); shift
+      elif [ "$ACTION" = "menu" ]; then
+        # hy relay list 这类：菜单命令后面带子命令，直接转交给 relay
+        ACTION="relay"; SUB+=("$1"); shift
       else die "未知参数：$1（--help 查看帮助）"; fi ;;
   esac
 done
 
 # 通过 curl | bash 执行时，stdin 是脚本内容，交互输入需改走终端
 # 用真实打开测试而非 [ -e ]：容器里 /dev/tty 可能存在但打不开
-if [ "$ASSUME_YES" -eq 0 ] && [ "$ACTION" = "install" ] && [ ! -t 0 ] && { : </dev/tty; } 2>/dev/null; then
+case "$ACTION" in install|menu|relay|masq) INTERACTIVE=1 ;; *) INTERACTIVE=0 ;; esac
+if [ "$ASSUME_YES" -eq 0 ] && [ "$INTERACTIVE" -eq 1 ] && [ ! -t 0 ] && { : </dev/tty; } 2>/dev/null; then
   exec </dev/tty
 fi
 
@@ -1141,7 +1198,7 @@ do_install() {
     fi
     if ! confirm "覆盖现有配置并重装？" "n"; then
       info "已取消。查看节点：bash install.sh info"
-      exit 0
+      return 0
     fi
     FORCE=1
   fi
@@ -1155,7 +1212,7 @@ do_install() {
   collect_config
   show_summary
   if [ "$ASSUME_YES" -eq 0 ]; then
-    confirm "确认开始安装？" "y" || { info "已取消"; exit 0; }
+    confirm "确认开始安装？" "y" || { info "已取消"; return 0; }
   fi
 
   # 安装
@@ -1204,7 +1261,12 @@ do_install() {
   save_meta
 
   print_info
+  # 装一份本机副本：以后敲 hy 就能进菜单，不用再 curl
+  self_install >/dev/null 2>&1 || true
   ok "部署完成。日志：$(svc_log_hint)"
+  if [ -x /usr/local/bin/hy ]; then
+    hint "以后直接敲 hy 进管理菜单，加减节点、转发、改伪装都在里面"
+  fi
 }
 
 do_upgrade() {
@@ -1292,8 +1354,922 @@ do_uninstall() {
   ok "已卸载（防火墙规则请按需手动清理）"
 }
 
+# ==============================================================================
+#  节点转发（中转机）
+#
+#  场景：VPS1 是落地机（跑 Hysteria2），VPS2 是中转机（线路好但落地差）。
+#        让客户端连 VPS2，由 VPS2 把 UDP 包原样转给 VPS1。
+#
+#  实现选型：内核 iptables DNAT，不用 realm / gost / nginx。
+#    - Hysteria2 只有 QUIC(UDP)，内核转发是零额外进程、零用户态拷贝，延迟最低
+#    - 不会因为代理进程崩溃、被 OOM 杀掉而断流，规则在 netfilter 里
+#    - 不需要在中转机装 Hysteria，转发跟服务端完全解耦
+#
+#  为什么 DNAT 之后还必须 MASQUERADE：
+#    只做 DNAT 时，落地机收到的源地址还是真实客户端 IP，于是回包会绕过中转机
+#    直接发给客户端；而客户端的 socket 连的是中转机，源地址对不上就被内核丢掉，
+#    表现为「握手成功、一发数据就卡死」。加上 MASQUERADE 后回程才会走回中转机。
+#
+#  为什么中转链接里 sni / pinSHA256 / obfs 一个字都不用改：
+#    TLS 和混淆都是客户端 ↔ 落地机的端到端行为，中转机只看 UDP 五元组，
+#    所以只需把链接里的「地址:端口」换成本机，其余原样保留。
+# ==============================================================================
+
+relay_dep() {
+  if ! has iptables; then
+    pkg_install iptables
+  fi
+  has iptables || die "缺少 iptables，无法做 UDP 转发。Debian/Ubuntu：apt install -y iptables；Alpine：apk add iptables"
+}
+
+relay_name_ok() { [[ "${1:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$ ]]; }
+
+port_ok() { [[ "${1:-}" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]; }
+
+# 域名解析成 IPv4，统一在这里做，避免 iptables 命令行里出现域名（重启时解析失败会静默失效）
+resolve4() {
+  local h="$1" ip=""
+  is_ip "$h" && { printf '%s' "$h"; return 0; }
+  if has getent; then
+    ip="$(getent ahostsv4 "$h" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+  fi
+  if [ -z "$ip" ] && has nslookup; then
+    ip="$(nslookup "$h" 2>/dev/null | awk '/^Address: /{print $2; exit}' || true)"
+  fi
+  if [ -z "$ip" ] && has ping; then
+    ip="$(ping -4 -c1 -W2 "$h" 2>/dev/null | sed -n 's/^PING.*(\([0-9.]*\)).*/\1/p' | head -n1 || true)"
+  fi
+  printf '%s' "$ip"
+}
+
+# 百分号解码（链接里的密码/名称可能被转义）
+uri_dec() {
+  local s="${1:-}" out="" hex c
+  while [[ "$s" == *%* ]]; do
+    out+="${s%%\%*}"
+    s="${s#*\%}"
+    hex="${s:0:2}"
+    s="${s:2}"
+    if [[ "$hex" =~ ^[0-9A-Fa-f]{2}$ ]]; then
+      printf -v c "\\x${hex}"
+      out+="$c"
+    else
+      out+="%${hex}"
+    fi
+  done
+  printf '%s' "${out}${s}"
+}
+
+# 解析 hysteria2:// 链接，结果写进 P_* 全局变量
+parse_uri() {
+  local u="${1:-}" frag="" q="" userinfo="" hostport="" kvp k v oldifs="$IFS"
+  P_PWD=""; P_HOST=""; P_PORT="443"; P_SNI=""; P_INSECURE=""; P_PIN=""
+  P_OBFSTYPE=""; P_OBFSPWD=""; P_MPORT=""; P_NAME=""
+
+  case "$u" in
+    hysteria2://*|hy2://*) u="${u#*://}" ;;
+    *) return 1 ;;
+  esac
+  case "$u" in *"#"*) frag="${u#*#}"; u="${u%%#*}" ;; esac
+  case "$u" in *"?"*) q="${u#*\?}"; u="${u%%\?*}" ;; esac
+
+  if [[ "$u" == *@* ]]; then
+    userinfo="${u%@*}"
+    hostport="${u##*@}"
+  else
+    hostport="$u"
+  fi
+  hostport="${hostport%%/*}"
+
+  P_PWD="$(uri_dec "$userinfo")"
+  P_NAME="$(uri_dec "$frag")"
+
+  if [[ "$hostport" == \[* ]]; then
+    # [IPv6]:port
+    P_HOST="${hostport#\[}"
+    P_HOST="${P_HOST%%\]*}"
+    local rest="${hostport#*\]}"
+    rest="${rest#:}"
+    [ -n "$rest" ] && P_PORT="$rest"
+  elif [[ "$hostport" == *:*:* ]]; then
+    P_HOST="$hostport"            # 裸 IPv6，没写端口
+  elif [[ "$hostport" == *:* ]]; then
+    P_HOST="${hostport%%:*}"
+    P_PORT="${hostport##*:}"
+  else
+    P_HOST="$hostport"
+  fi
+
+  IFS='&'
+  for kvp in $q; do
+    k="${kvp%%=*}"
+    if [ "$k" = "$kvp" ]; then v=""; else v="${kvp#*=}"; fi
+    case "$k" in
+      sni)           P_SNI="$(uri_dec "$v")" ;;
+      insecure)      P_INSECURE="$v" ;;
+      pinSHA256|pin|pin-sha256) P_PIN="$(uri_dec "$v")" ;;
+      obfs)          P_OBFSTYPE="$v" ;;
+      obfs-password) P_OBFSPWD="$(uri_dec "$v")" ;;
+      mport|ports)   P_MPORT="$v" ;;
+    esac
+  done
+  IFS="$oldifs"
+
+  [ -n "$P_HOST" ] && port_ok "$P_PORT"
+}
+
+# ------------------------------ 节点存取 ------------------------------
+# 一条转发一个文件：/etc/hy2-relay/nodes/<名字>.conf，改坏一条不影响其它
+relay_load() {
+  N_NAME=""; N_LISTEN=""; N_THOST=""; N_TPORT=""; N_PWD=""; N_SNI=""
+  N_INSECURE=""; N_PIN=""; N_OBFSTYPE=""; N_OBFSPWD=""; N_NOTE=""
+  N_ENABLED="1"; N_URI=""
+  # shellcheck disable=SC1090
+  . "$1"
+}
+
+relay_get() {
+  local name="${1:-}" f
+  relay_name_ok "$name" || { warn "名字只能用字母数字和 . _ -，长度 1~32"; return 1; }
+  f="${RELAY_NODES}/${name}.conf"
+  [ -f "$f" ] || { warn "没有这个转发节点：${name}（hy relay list 查看）"; return 1; }
+  relay_load "$f"
+}
+
+relay_save() {
+  local f="${RELAY_NODES}/${N_NAME}.conf"
+  mkdir -p "$RELAY_NODES"
+  {
+    printf 'N_NAME=%q\n'      "$N_NAME"
+    printf 'N_LISTEN=%q\n'    "$N_LISTEN"
+    printf 'N_THOST=%q\n'     "$N_THOST"
+    printf 'N_TPORT=%q\n'     "$N_TPORT"
+    printf 'N_PWD=%q\n'       "$N_PWD"
+    printf 'N_SNI=%q\n'       "$N_SNI"
+    printf 'N_INSECURE=%q\n'  "$N_INSECURE"
+    printf 'N_PIN=%q\n'       "$N_PIN"
+    printf 'N_OBFSTYPE=%q\n'  "$N_OBFSTYPE"
+    printf 'N_OBFSPWD=%q\n'   "$N_OBFSPWD"
+    printf 'N_NOTE=%q\n'      "$N_NOTE"
+    printf 'N_ENABLED=%q\n'   "$N_ENABLED"
+    printf 'N_URI=%q\n'       "$N_URI"
+  } > "$f"
+  chmod 600 "$f"
+}
+
+relay_count() {
+  local f n=0
+  [ -d "$RELAY_NODES" ] || { printf '0'; return 0; }
+  for f in "$RELAY_NODES"/*.conf; do
+    [ -e "$f" ] || continue
+    n=$((n + 1))
+  done
+  printf '%s' "$n"
+}
+
+# 中转机自己的公网 IP（客户端要连的地址）。
+# 菜单每刷一屏都会调用它，必须带缓存：探测一次要访问三个外部站点，慢的时候能拖十几秒。
+relay_listen_ip() {
+  local ip="${MENU_IP:-}" f="${RELAY_DIR}/.pubip" ts="0" now="" age=0
+  if [ -n "$ip" ]; then printf '%s' "$ip"; return 0; fi
+  if [ -f "$f" ]; then
+    ip="$(sed -n '1p' "$f" 2>/dev/null || true)"
+    ts="$(sed -n '2p' "$f" 2>/dev/null || true)"
+    [[ "$ts" =~ ^[0-9]+$ ]] || ts=0
+    now="$(date +%s)"
+    age=$((now - ts))
+    if [ -n "$ip" ] && [ "$age" -ge 0 ] && [ "$age" -lt 86400 ]; then
+      printf '%s' "$ip"; return 0
+    fi
+  fi
+  ip="$(detect_pubip)"
+  if [ -n "$ip" ]; then
+    mkdir -p "$RELAY_DIR" 2>/dev/null || true
+    printf '%s\n%s\n' "$ip" "$(date +%s)" > "$f" 2>/dev/null || true
+  fi
+  printf '%s' "$ip"
+}
+
+# ------------------------------ 规则生成与下发 ------------------------------
+# 把当前所有节点渲染成两个自带 shebang 的脚本，再执行它。
+# 这样做的好处：开机自启只需要一个 sh 脚本，不依赖 /usr/local/bin/hy2 还在不在，
+# 规则永远和 nodes/*.conf 一致（每次 apply 都整体重写，不用做增量 diff）。
+relay_render() {
+  local ipt n=0 seen="|" f ip tgt lines_pre lines_post
+  ipt="$(command -v iptables 2>/dev/null || true)"
+  [ -n "$ipt" ] || ipt="/sbin/iptables"
+  mkdir -p "$RELAY_DIR"
+
+  lines_pre=""
+  lines_post=""
+
+  for f in "$RELAY_NODES"/*.conf; do
+    [ -e "$f" ] || continue
+    relay_load "$f"
+    [ "${N_ENABLED:-1}" = "1" ] || continue
+    ip="$(resolve4 "$N_THOST")"
+    if [ -z "$ip" ]; then
+      warn "跳过 ${N_NAME}：解析不到 ${N_THOST} 的 IP"
+      continue
+    fi
+    n=$((n + 1))
+    lines_pre="${lines_pre}${ipt} -t nat -A HY2R_PRE -p udp --dport ${N_LISTEN} -j DNAT --to-destination ${ip}:${N_TPORT}
+"
+    tgt="|${ip}:${N_TPORT}|"
+    case "$seen" in
+      *"$tgt"*) : ;;   # 多条规则指向同一落地端口，一条 MASQUERADE 就够
+      *) seen="${seen}${ip}:${N_TPORT}|"
+         lines_post="${lines_post}${ipt} -t nat -A HY2R_POST -p udp -d ${ip} --dport ${N_TPORT} -j MASQUERADE
+" ;;
+    esac
+  done
+
+  RELAY_RULE_COUNT="$n"
+
+  {
+    printf '#!/bin/sh\n'
+    printf '# 由 hy2 生成，勿手改；改规则请用 hy relay ...，会自动重写本文件\n'
+    printf 'IPT=%s\n\n' "$ipt"
+    printf '# nat 自定义链：只动自己的链，不碰系统上已有的规则\n'
+    printf '$IPT -t nat -N HY2R_PRE 2>/dev/null\n'
+    printf '$IPT -t nat -N HY2R_POST 2>/dev/null\n'
+    printf '$IPT -t nat -C PREROUTING -j HY2R_PRE 2>/dev/null || $IPT -t nat -I PREROUTING 1 -j HY2R_PRE\n'
+    printf '$IPT -t nat -C POSTROUTING -j HY2R_POST 2>/dev/null || $IPT -t nat -I POSTROUTING 1 -j HY2R_POST\n'
+    printf '$IPT -t nat -F HY2R_PRE\n'
+    printf '$IPT -t nat -F HY2R_POST\n\n'
+    if [ "$n" -gt 0 ]; then
+      printf '%s' "$lines_pre"
+      printf '\n'
+      printf '%s' "$lines_post"
+    else
+      printf '# 没有任何启用的规则：摘掉跳转并删掉自定义链\n'
+      printf '$IPT -t nat -D PREROUTING -j HY2R_PRE 2>/dev/null\n'
+      printf '$IPT -t nat -D POSTROUTING -j HY2R_POST 2>/dev/null\n'
+      printf '$IPT -t nat -F HY2R_PRE 2>/dev/null\n'
+      printf '$IPT -t nat -F HY2R_POST 2>/dev/null\n'
+      printf '$IPT -t nat -X HY2R_PRE 2>/dev/null\n'
+      printf '$IPT -t nat -X HY2R_POST 2>/dev/null\n'
+    fi
+    printf '\nexit 0\n'
+  } > "$RELAY_APPLY"
+
+  {
+    printf '#!/bin/sh\n'
+    printf '# 由 hy2 生成：移除全部转发规则（不卸载 Hysteria，只清 netfilter）\n'
+    printf 'IPT=%s\n\n' "$ipt"
+    printf '$IPT -t nat -D PREROUTING -j HY2R_PRE 2>/dev/null\n'
+    printf '$IPT -t nat -D POSTROUTING -j HY2R_POST 2>/dev/null\n'
+    printf '$IPT -t nat -F HY2R_PRE 2>/dev/null\n'
+    printf '$IPT -t nat -F HY2R_POST 2>/dev/null\n'
+    printf '$IPT -t nat -X HY2R_PRE 2>/dev/null\n'
+    printf '$IPT -t nat -X HY2R_POST 2>/dev/null\n'
+    printf 'exit 0\n'
+  } > "$RELAY_CLEAR"
+
+  chmod 755 "$RELAY_APPLY" "$RELAY_CLEAR"
+}
+
+# 转发必须的内核开关。QUIC 是长连接，conntrack 默认 30/120 秒太久不动就回收，
+# 表现是「放着不用一会儿就断」，所以一并放大。
+relay_sysctl() {
+  local have_ct=0
+  if has modprobe; then modprobe nf_conntrack >/dev/null 2>&1 || true; fi
+  [ -e /proc/sys/net/netfilter/nf_conntrack_udp_timeout ] && have_ct=1
+
+  {
+    printf '# 由 hy2 生成：中转机转发开关\n'
+    printf 'net.ipv4.ip_forward = 1\n'
+    if [ "$have_ct" -eq 1 ]; then
+      printf 'net.netfilter.nf_conntrack_udp_timeout = 300\n'
+      printf 'net.netfilter.nf_conntrack_udp_timeout_stream = 1800\n'
+    fi
+  } > "$RELAY_SYSCTL"
+
+  sysctl -p "$RELAY_SYSCTL" >/dev/null 2>&1 || true
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" != "1" ]; then
+    warn "ip_forward 未能打开，转发不会生效（容器或受限内核常见）"
+  fi
+}
+
+# 开机自启：一个 oneshot 服务，跑的就是上面生成的 apply.sh
+relay_service() {
+  detect_init
+  case "$INIT_SYS" in
+    systemd)
+      cat > "${SYSTEMD_DIR}/${RELAY_SVC}.service" <<EOF
+[Unit]
+Description=HY2 relay (UDP DNAT to landing server)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=${RELAY_APPLY}
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh ${RELAY_APPLY}
+ExecStop=/bin/sh ${RELAY_CLEAR}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      systemctl enable "$RELAY_SVC" >/dev/null 2>&1 || true
+      systemctl restart "$RELAY_SVC" >/dev/null 2>&1 || true ;;
+    openrc)
+      cat > "${OPENRC_DIR}/${RELAY_SVC}" <<EOF
+#!/sbin/openrc-run
+description="HY2 relay (UDP DNAT to landing server)"
+
+depend() { need net; after firewall; }
+
+start() {
+  ebegin "Applying HY2 relay rules"
+  /bin/sh ${RELAY_APPLY}
+  eend \$?
+}
+
+stop() {
+  ebegin "Clearing HY2 relay rules"
+  /bin/sh ${RELAY_CLEAR}
+  eend \$?
+}
+EOF
+      chmod 755 "${OPENRC_DIR}/${RELAY_SVC}"
+      rc-update add "$RELAY_SVC" default >/dev/null 2>&1 || true
+      rc-service "$RELAY_SVC" restart >/dev/null 2>&1 || true ;;
+    *)
+      warn "未识别 init 系统：规则重启后不会自动恢复，可把 ${RELAY_APPLY} 加进开机脚本" ;;
+  esac
+}
+
+relay_apply() {
+  local quiet="${1:-}" got=0
+  relay_dep
+  relay_sysctl
+  relay_render
+
+  if ! sh "$RELAY_APPLY"; then
+    die "应用转发规则失败：容器里可能没有 nat 表，或内核模块被裁掉了"
+  fi
+
+  if [ "${RELAY_RULE_COUNT:-0}" -gt 0 ]; then
+    got="$(iptables -t nat -S HY2R_PRE 2>/dev/null | grep -c '^-A' || true)"
+    if [ "$got" != "$RELAY_RULE_COUNT" ]; then
+      die "规则写入不完整（期望 ${RELAY_RULE_COUNT} 条，实际 ${got} 条）"
+    fi
+    relay_service
+    [ "$quiet" = "--quiet" ] || ok "已应用 ${RELAY_RULE_COUNT} 条转发规则（开机自动恢复）"
+  else
+    [ "$quiet" = "--quiet" ] || info "没有启用的转发规则，已清空 netfilter 规则"
+  fi
+}
+
+relay_clear() {
+  relay_dep
+  [ -f "$RELAY_CLEAR" ] || relay_render
+  if ! sh "$RELAY_CLEAR"; then
+    die "清理规则失败"
+  fi
+  ok "已清空全部转发规则"
+}
+
+# 中转后的分享链接：只换地址和端口，sni / pin / obfs 原样保留
+relay_link() {
+  local name="${1:-}" ip="${2:-}" q="" frag
+  relay_get "$name" || return 1
+  [ -z "$ip" ] && ip="$(relay_listen_ip)"
+  [ -n "$N_SNI" ] && q="${q}&sni=$(uri_enc "$N_SNI")"
+  [ "$N_INSECURE" = "1" ] && q="${q}&insecure=1"
+  [ -n "$N_PIN" ] && q="${q}&pinSHA256=$(uri_enc "$N_PIN")"
+  if [ -n "$N_OBFSPWD" ]; then
+    q="${q}&obfs=${N_OBFSTYPE:-salamander}&obfs-password=$(uri_enc "$N_OBFSPWD")"
+  fi
+  q="${q#&}"
+  [ -z "$q" ] && q="sni=$(uri_enc "$ip")"
+  frag="HY2-${name}"
+  printf 'hysteria2://%s@%s:%s/?%s#%s' "$(uri_enc "$N_PWD")" "$ip" "$N_LISTEN" "$q" "$(uri_enc "$frag")"
+}
+
+relay_list() {
+  local with_link="${1:-}" ip="" i=0 f st
+  if [ "$(relay_count)" -eq 0 ]; then
+    info "还没有转发规则。用 hy relay add 添加，或在菜单里选 3"
+    return 0
+  fi
+  ip="$(relay_listen_ip)"
+  echo
+  hr
+  printf ' %s转发规则%s   共 %s 条\n' "$C_W" "$C_0" "$(relay_count)"
+  hr
+  for f in "$RELAY_NODES"/*.conf; do
+    [ -e "$f" ] || continue
+    relay_load "$f"
+    i=$((i + 1))
+    if [ "${N_ENABLED:-1}" = "1" ]; then st="启用"; else st="停用"; fi
+    printf ' %2s) %-14s %-7s %-24s %s\n' "$i" "$N_NAME" ":${N_LISTEN}" "${N_THOST}:${N_TPORT}" "$st"
+    [ -n "${N_NOTE:-}" ] && printf '      %s%s%s\n' "$C_D" "$N_NOTE" "$C_0"
+  done
+  hr
+  hint "本机监听 → 落地目标；客户端连的是本机公网 IP + 左侧端口"
+
+  if [ "$with_link" = "--links" ]; then
+    for f in "$RELAY_NODES"/*.conf; do
+      [ -e "$f" ] || continue
+      relay_load "$f"
+      [ "${N_ENABLED:-1}" = "1" ] || continue
+      echo
+      printf ' %s%s%s\n' "$C_B" "$N_NAME" "$C_0"
+      printf ' %s\n' "$(relay_link "$N_NAME" "$ip")"
+    done
+    echo
+  else
+    echo
+    hint "看链接：hy relay link <名字>    全部链接：hy relay list --links"
+  fi
+}
+
+# 端口占用检查：不能和另一条转发、本机 Hysteria 服务端、其它 UDP 监听撞车。
+# 返回 1 时把原因写在 stdout，由调用方决定是报错退出还是重新问一次
+# （交互向导里要能重填，所以这里不能直接 die）。
+relay_port_conflict() {
+  local p="$1" self="${2:-}" f srvport="" who=""
+  if [ -d "$RELAY_NODES" ]; then
+    for f in "$RELAY_NODES"/*.conf; do
+      [ -e "$f" ] || continue
+      relay_load "$f"
+      [ "$N_NAME" = "$self" ] && continue
+      if [ "${N_LISTEN:-}" = "$p" ]; then
+        printf 'UDP %s 已被转发规则 %s 占用，换一个端口' "$p" "$N_NAME"
+        return 1
+      fi
+    done
+  fi
+  if [ -f "$META" ]; then
+    srvport="$(awk -F= '/^M_PORT=/{gsub(/["\047]/,"",$2); print $2}' "$META" 2>/dev/null || true)"
+    if [ -n "$srvport" ] && [ "$srvport" = "$p" ]; then
+      printf 'UDP %s 是本机 Hysteria 服务端的端口，中转要换一个（如 20001）' "$p"
+      return 1
+    fi
+  fi
+  if has ss; then
+    who="$(ss -lunp 2>/dev/null | awk -v P=":${p}$" 'NR>1 && $4 ~ P {print $NF}' | head -n1 || true)"
+    if [ -n "$who" ]; then
+      printf 'UDP %s 已被本机进程占用（%s），换一个端口' "$p" "$who"
+      return 1
+    fi
+  fi
+  return 0
+}
+
+relay_port_guard() {
+  local reason=""
+  reason="$(relay_port_conflict "${1:-}" "${2:-}")" || die "${reason}"
+}
+
+# ------------------------------ 添加 ------------------------------
+# 从解析好的 P_* 落地信息生成一条转发
+relay_add_commit() {
+  local listen="$1" name="$2" note="$3" ip=""
+  relay_port_guard "$listen" "$name"
+
+  N_NAME="$name"
+  N_LISTEN="$listen"
+  N_THOST="$P_HOST"
+  N_TPORT="$P_PORT"
+  N_PWD="$P_PWD"
+  N_SNI="$P_SNI"
+  N_INSECURE="$P_INSECURE"
+  N_PIN="$P_PIN"
+  N_OBFSTYPE="$P_OBFSTYPE"
+  N_OBFSPWD="$P_OBFSPWD"
+  N_NOTE="$note"
+  N_ENABLED="1"
+  N_URI="$URI_RAW"
+  relay_save
+
+  relay_apply --quiet
+  ip="$(relay_listen_ip)"
+
+  ok "已添加：${name}   ${ip}:${listen} → ${P_HOST}:${P_PORT}（UDP）"
+  echo
+  printf ' %s新链接（把原来那条换成它）%s\n' "$C_W" "$C_0"
+  printf ' %s\n' "$(relay_link "$name" "$ip")"
+  echo
+  hint "落地机上的节点不要删，删了这条转发就没目标了"
+  hint "防火墙：中转机要放行 UDP ${listen}，落地机要放行 UDP ${P_PORT}（云厂商安全组也看一遍）"
+}
+
+relay_add_interactive() {
+  local uri="" listen="" name="" note="" tries=0 defname=""
+  step "添加转发节点"
+  hint "在落地机上执行 hy → 2，把它给出的一条 hysteria2:// 链接整条粘贴过来"
+  hint "落地机不用做任何改动，也不用知道中转机的存在"
+  echo
+  ask "落地机链接（回车改为手填）" uri ""
+  uri="$(printf '%s' "$uri" | tr -d '[:space:]')"
+
+  if [ -n "$uri" ]; then
+    if ! parse_uri "$uri"; then
+      warn "这不像 hysteria2:// 链接，检查一下有没有复制全"
+      return 0
+    fi
+    URI_RAW="$uri"
+  else
+    # 手填：至少要有落地 IP、端口、密码
+    local h="" p="" pw="" ob="" sni=""
+    ask "落地机 IP 或域名" h ""
+    is_ip "$h" || { [ -z "$h" ] && { info "已取消"; return 0; }; }
+    ask "落地机端口" p "443"
+    port_ok "$p" || { warn "端口不合法"; return 0; }
+    ask "节点密码" pw ""
+    [ -z "$pw" ] && { info "已取消"; return 0; }
+    ask "混淆密码（没有就回车）" ob ""
+    ask "SNI（没有就回车，默认落地机地址）" sni ""
+    P_PWD="$pw"; P_HOST="$h"; P_PORT="$p"; P_SNI="$sni"
+    P_OBFSTYPE=""; [ -n "$ob" ] && P_OBFSTYPE="salamander"
+    P_OBFSPWD="$ob"; P_PIN=""; P_INSECURE="1"
+    P_MPORT=""; P_NAME=""
+    URI_RAW=""
+  fi
+
+  echo
+  kv "落地地址      " "${P_HOST}:${P_PORT} (UDP)"
+  kv "密码          " "${P_PWD}"
+  [ -n "$P_SNI" ] && kv "SNI           " "${P_SNI}"
+  [ -n "$P_PIN" ] && kv "pinSHA256     " "${P_PIN:0:16}…"
+  [ -n "$P_OBFSPWD" ] && kv "混淆          " "${P_OBFSTYPE:-salamander} / ${P_OBFSPWD}"
+  [ -n "$P_MPORT" ] && warn "原链接带端口跳跃 mport=${P_MPORT}，中转只转发单端口，跳跃会失效"
+  echo
+
+  local reason="" cand="" picked=0
+  while [ "$tries" -lt 5 ]; do
+    tries=$((tries + 1))
+    ask "本机监听端口" listen "$P_PORT"
+    if ! port_ok "$listen"; then warn "端口要在 1-65535 之间"; continue; fi
+    if reason="$(relay_port_conflict "$listen" "")"; then picked=1; break; fi
+    warn "${reason}"
+    # 撞车后把默认值往前挪到一个空端口，免得每次回车都撞同一个
+    cand="$listen"
+    while [ "$cand" -lt 65000 ]; do
+      cand=$((cand + 1))
+      if relay_port_conflict "$cand" "" >/dev/null 2>&1; then P_PORT="$cand"; break; fi
+    done
+  done
+  [ "$picked" -eq 1 ] || { warn "连试 5 次都不行，先退出"; return 0; }
+
+  defname="$(printf '%s' "$P_HOST" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-24)"
+  defname="${defname#-}"; defname="${defname%-}"
+  [ -z "$defname" ] && defname="node$(relay_count)"
+  while :; do
+    ask "名字（字母数字，用于区分多条）" name "$defname"
+    relay_name_ok "$name" && break
+    warn "名字只能用字母数字和 . _ -"
+    [ "$ASSUME_YES" -eq 1 ] && return 0
+  done
+  ask "备注（可空）" note ""
+
+  relay_add_commit "$listen" "$name" "$note"
+}
+
+# ------------------------------ 修改 / 删除 ------------------------------
+relay_pick() { # relay_pick "提示" -> PICK_NAME
+  local prompt="$1" i=0 f idx names=()
+  if [ "$(relay_count)" -eq 0 ]; then info "还没有转发规则"; return 1; fi
+  for f in "$RELAY_NODES"/*.conf; do
+    [ -e "$f" ] || continue
+    relay_load "$f"
+    i=$((i + 1))
+    names+=("$N_NAME")
+    printf ' %2s) %-14s %-7s %s\n' "$i" "$N_NAME" ":${N_LISTEN}" "${N_THOST}:${N_TPORT}"
+  done
+  echo
+  read -r -p "${C_B}?${C_0} ${prompt} [1]: " idx || true
+  idx="${idx:-1}"
+  [[ "$idx" =~ ^[0-9]+$ ]] && [ "$idx" -ge 1 ] && [ "$idx" -le "${#names[@]}" ] || { warn "序号不对"; return 1; }
+  PICK_NAME="${names[$((idx - 1))]}"
+}
+
+relay_edit() {
+  local name="${1:-}" listen="" note="" en=""
+  if [ -z "$name" ]; then
+    relay_pick "改哪一条" || return 1
+    name="$PICK_NAME"
+  fi
+  relay_get "$name" || return 1
+
+  step "修改转发：${name}"
+  kv "落地          " "${N_THOST}:${N_TPORT} (UDP)"
+  kv "本机监听      " "UDP ${N_LISTEN}"
+  kv "状态          " "$([ "${N_ENABLED:-1}" = "1" ] && echo 启用 || echo 停用)"
+  echo
+  hint "落地地址不在这里改：换落地机请删掉重建，免得密码和落地机对不上"
+  echo
+  ask "本机监听端口" listen "$N_LISTEN"
+  port_ok "$listen" || { warn "端口不合法"; return 1; }
+  relay_port_guard "$listen" "$name"
+  ask "备注" note "${N_NOTE:-}"
+  if [ "${N_ENABLED:-1}" = "1" ]; then
+    if confirm "保持启用？选 n 则暂时停用（保留配置）" "y"; then en="1"; else en="0"; fi
+  else
+    if confirm "现在启用？" "y"; then en="1"; else en="0"; fi
+  fi
+
+  # 端口变了，旧链接就失效了，提前说清楚
+  if [ "$listen" != "$N_LISTEN" ]; then
+    warn "监听端口从 ${N_LISTEN} 改成 ${listen}，客户端要换新链接"
+  fi
+
+  N_LISTEN="$listen"
+  N_NOTE="$note"
+  N_ENABLED="$en"
+  relay_save
+  relay_apply --quiet
+  ok "已保存并生效"
+  printf ' %s\n' "$(relay_link "$name")"
+}
+
+relay_del() {
+  local name="${1:-}" sure=""
+  if [ -z "$name" ]; then
+    relay_pick "删哪一条" || return 1
+    name="$PICK_NAME"
+  fi
+  relay_get "$name" || return 1
+  kv "落地          " "${N_THOST}:${N_TPORT}"
+  kv "本机监听      " "UDP ${N_LISTEN}"
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    warn "只删本机转发规则，不动落地机上的 Hysteria"
+    ask "输入名字确认删除：${name}" sure ""
+    [ "$sure" = "$name" ] || { info "已取消"; return 0; }
+  fi
+  rm -f "${RELAY_NODES}/${name}.conf" 2>/dev/null || true
+  relay_apply --quiet
+  ok "已删除 ${name}，规则已重算"
+}
+
+relay_toggle() {
+  local name="${1:-}" to="${2:-}"
+  if [ -z "$name" ]; then
+    relay_pick "改哪一条的启停" || return 1
+    name="$PICK_NAME"
+  fi
+  relay_get "$name" || return 1
+  [ -z "$to" ] && { if [ "${N_ENABLED:-1}" = "1" ]; then to="0"; else to="1"; fi; }
+  N_ENABLED="$to"
+  relay_save
+  relay_apply --quiet
+  if [ "$to" = "1" ]; then ok "${name} 已启用"; else ok "${name} 已停用（配置保留，随时可开）"; fi
+}
+
+# ------------------------------ 排障 ------------------------------
+relay_diag() {
+  local f n=0 ip
+  step "转发链路自检"
+  relay_dep
+
+  if [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null || echo 0)" = "1" ]; then
+    ok "ip_forward = 1"
+  else
+    warn "ip_forward != 1，转发不会生效；执行 hy relay apply 重新写入"
+  fi
+
+  if iptables -t nat -S HY2R_PRE >/dev/null 2>&1; then
+    n="$(iptables -t nat -S HY2R_PRE 2>/dev/null | grep -c '^-A' || true)"
+    ok "自定义链 HY2R_PRE 存在，规则 ${n} 条"
+  else
+    warn "自定义链不存在：还没添加过规则，或者被别的防火墙工具清掉了"
+    return 0
+  fi
+
+  echo
+  printf ' %s命中计数（第一列是包数，为 0 说明客户端根本没打到这里）%s\n' "$C_D" "$C_0"
+  iptables -t nat -L HY2R_PRE -vn 2>/dev/null || true
+  echo
+
+  for f in "$RELAY_NODES"/*.conf; do
+    [ -e "$f" ] || continue
+    relay_load "$f"
+    ip="$(resolve4 "$N_THOST")"
+    if [ -z "$ip" ]; then
+      warn "${N_NAME}：解析不到 ${N_THOST}"
+    elif [ "$ip" != "$N_THOST" ]; then
+      info "${N_NAME}：${N_THOST} → ${ip}"
+    fi
+  done
+
+  echo
+  hint "包数不动：客户端连的地址/端口不对，或中转机安全组没放行"
+  hint "包数在涨但连不上：落地机没放行 UDP，或落地机服务没起（落地机上 hy status 看）"
+  hint "两边都正常但仍断：落地机把客户端 IP 当成了中转机 IP，多设备限速类功能会失效"
+}
+
+# ------------------------------ 命令行入口 ------------------------------
+do_relay() {
+  need_root
+  local sub="${SUB[0]:-list}" name="${SUB[1]:-}" listen="" ip=""
+
+  case "$sub" in
+    add|a)
+      if [ -n "${RELAY_LINK:-}" ]; then
+        parse_uri "$RELAY_LINK" || die "链接解析失败，需要 hysteria2:// 开头"
+        URI_RAW="$RELAY_LINK"
+      elif [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
+        relay_add_interactive
+        return 0
+      else
+        die "非交互添加需要 --link <落地机链接>"
+      fi
+      listen="${RELAY_LISTEN_ARG:-}"
+      [ -z "$listen" ] && listen="$P_PORT"
+      port_ok "$listen" || die "监听端口不合法：${listen}"
+      name="${RELAY_NAME:-}"
+      if [ -z "$name" ]; then
+        name="$(printf '%s' "$P_HOST" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-24)"
+        name="${name#-}"; name="${name%-}"
+      fi
+      relay_name_ok "$name" || die "名字只能用字母数字和 . _ -"
+      [ -f "${RELAY_NODES}/${name}.conf" ] && { [ "$FORCE" -eq 1 ] || die "已存在 ${name}，加 --force 覆盖，或换个 --name"; }
+      relay_add_commit "$listen" "$name" "${RELAY_NOTE:-}"
+      ;;
+    list|ls)
+      relay_list "${SUB[1]:-}"
+      ;;
+    link)
+      [ -n "$name" ] || die "用法：hy relay link <名字>"
+      ip="$(relay_listen_ip)"
+      local one=""
+      one="$(relay_link "$name" "$ip")" || exit 1
+      [ -n "$one" ] || exit 1
+      printf '%s\n' "$one"
+      ;;
+    del|rm|delete)
+      relay_del "$name"
+      ;;
+    edit|mod)
+      relay_edit "$name"
+      ;;
+    enable)  relay_toggle "$name" "1" ;;
+    disable) relay_toggle "$name" "0" ;;
+    apply)   relay_apply ;;
+    clear)   relay_clear ;;
+    diag|test) relay_diag ;;
+    menu)    relay_menu ;;
+    *) die "用法：hy relay [add|list|link|edit|del|enable|disable|apply|clear|diag]" ;;
+  esac
+}
+
+relay_menu() {
+  local c=""
+  while :; do
+    echo
+    relay_list
+    echo
+    printf '   %s1%s) 添加转发\n' "$C_B" "$C_0"
+    printf '   %s2%s) 改端口 / 备注 / 启停\n' "$C_B" "$C_0"
+    printf '   %s3%s) 删除\n' "$C_B" "$C_0"
+    printf '   %s4%s) 全部链接\n' "$C_B" "$C_0"
+    printf '   %s5%s) 重新应用规则\n' "$C_B" "$C_0"
+    printf '   %s6%s) 排障自检\n' "$C_B" "$C_0"
+    printf '   %s0%s) 返回\n' "$C_B" "$C_0"
+    read -r -p "${C_B}?${C_0} 选择 [1]: " c || return 0
+    case "${c:-1}" in
+      1) relay_add_interactive ;;
+      2) relay_edit ;;
+      3) relay_del ;;
+      4) relay_list --links ;;
+      5) relay_apply ;;
+      6) relay_diag ;;
+      0|q|Q) return 0 ;;
+      *) warn "输入 0-6" ;;
+    esac
+  done
+}
+
+# ------------------------------ hy 命令 ------------------------------
+# 把脚本自身装到本机，之后敲 hy 就能进菜单，不用每次 curl
+self_install() {
+  local tmp="/usr/local/bin/.hy2.$$" okk=0
+  mkdir -p /usr/local/bin 2>/dev/null || true
+
+  if has curl && curl -fsSL --max-time 40 "$SELF_URL" -o "$tmp" 2>/dev/null; then
+    if head -n1 "$tmp" 2>/dev/null | grep -q '^#!/usr/bin/env bash'; then
+      chmod 755 "$tmp" 2>/dev/null || true
+      mv -f "$tmp" "$CLI_BIN" 2>/dev/null && okk=1
+    fi
+  fi
+  [ "$okk" -eq 0 ] && rm -f "$tmp" 2>/dev/null || true
+
+  # 拿不到网络时，如果本来就是从本地文件运行的，直接拷一份
+  if [ "$okk" -eq 0 ] && [ -f "$0" ] && [ "$0" != "$CLI_BIN" ]; then
+    cp -f "$0" "$CLI_BIN" 2>/dev/null && chmod 755 "$CLI_BIN" 2>/dev/null && okk=1 || true
+  fi
+
+  if [ "$okk" -eq 0 ]; then
+    warn "没能安装 hy 命令（下载失败），不影响当前操作"
+    return 1
+  fi
+
+  cat > /usr/local/bin/hy <<'WRAP'
+#!/bin/sh
+# hy —— Hysteria2 管理台；不带参数进菜单，带参数等同 hy2 <参数>
+[ $# -eq 0 ] && exec /usr/local/bin/hy2 menu
+exec /usr/local/bin/hy2 "$@"
+WRAP
+  chmod 755 /usr/local/bin/hy
+  ok "已安装命令：hy（菜单） / hy2（子命令）"
+}
+
+# ------------------------------ 主菜单 ------------------------------
+menu_banner() {
+  local srv="未安装" rt="0" ip="${MENU_IP:-}" os=""
+  if [ -f "$HY2_CONF" ]; then
+    if svc_active; then srv="运行中"; else srv="未运行"; fi
+  fi
+  rt="$(relay_count)"
+  os="$(sed -n 's/^PRETTY_NAME="\(.*\)"$/\1/p' /etc/os-release 2>/dev/null | head -n1 || true)"
+  [ -z "$os" ] && os="$(uname -s)"
+
+  echo
+  hr
+  printf ' %sHysteria2 管理台%s   %sv%s%s\n' "$C_W" "$C_0" "$C_D" "$SCRIPT_VERSION" "$C_0"
+  hr
+  printf ' 本机    %s   %s   %s\n' "${ip:-未知}" "$os" "${INIT_SYS:-none}"
+  printf ' 服务端  %s   %s\n' "$srv" "转发 ${rt} 条"
+  hr
+  # 单列排版：中文与 ASCII 混排时靠空格对齐必然错位（汉字 2 列、字节 3 个），
+  # 与其手工补空格，不如一列一个功能，怎么都不会歪。
+  printf '  %s1%s) 安装 / 重装服务端\n' "$C_B" "$C_0"
+  printf '  %s2%s) 节点信息与分享链接\n' "$C_B" "$C_0"
+  printf '  %s3%s) 添加转发（落地机 → 本机）\n' "$C_B" "$C_0"
+  printf '  %s4%s) 转发管理（改 / 删 / 启停 / 排障）\n' "$C_B" "$C_0"
+  printf '  %s5%s) 服务状态、重启、日志\n' "$C_B" "$C_0"
+  printf '  %s6%s) 修改伪装站点\n' "$C_B" "$C_0"
+  printf '  %s7%s) 升级 Hysteria / 卸载\n' "$C_B" "$C_0"
+  printf '  %s8%s) 更新 hy 命令\n' "$C_B" "$C_0"
+  printf '  %s0%s) 退出\n' "$C_B" "$C_0"
+  hr
+}
+
+menu_service() {
+  local c=""
+  echo
+  detect_init
+  svc_status || true
+  printf '   %s1%s) 重启   %s2%s) 日志   %s3%s) 状态   %s0%s) 返回\n' "$C_B" "$C_0" "$C_B" "$C_0" "$C_B" "$C_0" "$C_B" "$C_0"
+  read -r -p "${C_B}?${C_0} 选择 [0]: " c || return 0
+  case "${c:-0}" in
+    1) if svc_restart; then sleep 2; svc_active && ok "已重启" || warn "没起来，看日志"; else warn "重启失败"; fi ;;
+    2) svc_log_follow ;;
+    3) svc_status ;;
+  esac
+}
+
+menu_misc() {
+  local c=""
+  echo
+  printf '   %s1%s) 升级 Hysteria 二进制\n' "$C_B" "$C_0"
+  printf '   %s2%s) 卸载服务端\n' "$C_B" "$C_0"
+  printf '   %s0%s) 返回\n' "$C_B" "$C_0"
+  read -r -p "${C_B}?${C_0} 选择 [0]: " c || return 0
+  case "${c:-0}" in
+    1) do_upgrade ;;
+    2) do_uninstall ;;
+  esac
+}
+
+do_menu() {
+  need_root
+  detect_init
+  MENU_IP="$(detect_pubip)"
+  local c=""
+  while :; do
+    menu_banner
+    read -r -p "${C_B}?${C_0} 选择 [0]: " c || break
+    case "${c:-0}" in
+      1) do_install ;;
+      2)
+        if [ -f "$META" ]; then print_info; else warn "本机未安装 Hysteria2 服务端，只做中转"; fi
+        if [ "$(relay_count)" -gt 0 ]; then relay_list --links; fi ;;
+      3) relay_add_interactive ;;
+      4) relay_menu ;;
+      5) menu_service ;;
+      6) if [ -f "$META" ]; then do_masq; else warn "本机未安装服务端，没有伪装站点可改"; fi ;;
+      7) menu_misc ;;
+      8) self_install ;;
+      0|q|Q) break ;;
+      *) warn "输入 0-8" ;;
+    esac
+    echo
+    [ "$c" = "1" ] || { read -r -p "${C_D}回车返回菜单${C_0}" _ || true; }
+  done
+  ok "已退出"
+}
+
 case "$ACTION" in
   install)   do_install ;;
+  menu)      do_menu ;;
+  relay)     do_relay ;;
   info)      need_root; detect_init; print_info ;;
   masq)      do_masq ;;
   status)    detect_init; svc_status ;;

@@ -16,6 +16,8 @@
 - **自动放行防火墙**：ufw / firewalld / iptables 自动识别
 - **内核调优**：fq + BBR + 16MB UDP 缓冲区（已存在则跳过，不覆盖）
 - **装完即用**：输出 `hysteria2://` 链接、Clash Meta 片段、sing-box outbound、终端二维码
+- **一条命令管全部**：装完敲 `hy` 进菜单，加减节点、看链接、改伪装、起停服务都在里面
+- **中转（链式落地）**：落地机不动，中转机一条命令把 UDP 端口转过去并生成新链接，纯内核转发 0 额外进程
 - **可管理**：`info / status / log / restart / upgrade / uninstall`
 
 ## 支持的系统
@@ -288,14 +290,39 @@ proxies:
 
 ## 管理
 
+装完之后不用记命令，敲 `hy` 就是菜单：
+
+```
+------------------------------------------------------------
+ Hysteria2 管理台   v1.1.0
+------------------------------------------------------------
+ 本机    1.2.3.4   Debian GNU/Linux 12   systemd
+ 服务端  运行中   转发 2 条
+------------------------------------------------------------
+  1) 安装 / 重装服务端
+  2) 节点信息与分享链接
+  3) 添加转发（落地机 → 本机）
+  4) 转发管理（改 / 删 / 启停 / 排障）
+  5) 服务状态、重启、日志
+  6) 修改伪装站点
+  7) 升级 Hysteria / 卸载
+  8) 更新 hy 命令
+  0) 退出
+------------------------------------------------------------
+```
+
+`hy` 是 `hy2` 的快捷方式，带参数时等同子命令：`hy relay list` == `hy2 relay list`。第一次装服务端时脚本会自动把这两个命令写到 `/usr/local/bin`；只做中转、没装服务端的机器，跑一次 `bash install.sh menu` 也会装上。
+
+不想进菜单也可以直接调：
+
 ```bash
-bash install.sh info       # 重新打印节点信息与链接
-bash install.sh masq auto  # 只换伪装站点：auto/random/none/<URL>，密码与证书不变
-bash install.sh status     # 服务状态
-bash install.sh log        # 实时日志
-bash install.sh restart    # 重启
-bash install.sh upgrade    # 升级到最新版
-bash install.sh uninstall  # 卸载
+hy2 info       # 重新打印节点信息与链接
+hy2 masq auto  # 只换伪装站点：auto/random/none/<URL>，密码与证书不变
+hy2 status     # 服务状态
+hy2 log        # 实时日志
+hy2 restart    # 重启
+hy2 upgrade    # 升级到最新版
+hy2 uninstall  # 卸载
 ```
 
 或直接用原生服务管理命令：
@@ -312,20 +339,105 @@ tail -f /var/log/hysteria.log
 
 脚本会自动识别当前 init 系统，`status` / `log` / `restart` 这些子命令内部会调用对应的工具，不用你自己判断。
 
+## 中转（把 VPS1 的节点从 VPS2 转出去）
+
+典型场景：VPS1 是落地机（便宜、带宽大、线路差），VPS2 是中转机（线路好）。让客户端连 VPS2，由 VPS2 把 UDP 原样转给 VPS1。
+
+```
+    ┌────────┐   连 VPS2 的端口    ┌──────────────┐   UDP DNAT    ┌──────────────┐
+    │ 客户端 │ ─────────────────▶ │ 中转机 VPS2  │ ────────────▶ │ 落地机 VPS1  │
+    └────────┘   hysteria2://     └──────────────┘               └──────────────┘
+                  （新链接）        纯 iptables，不装 Hysteria      原节点不用改
+```
+
+### 三步
+
+**① 落地机 VPS1**：敲 `hy` → `2`，复制打印出来的链接（这步跟以前一样，不用做任何改动）
+
+**② 中转机 VPS2**：敲 `hy` → `3`，把链接粘进去
+
+```
+[>] 添加转发节点
+    在落地机上执行 hy → 2，把它给出的一条 hysteria2:// 链接整条粘贴过来
+    落地机不用做任何改动，也不用知道中转机的存在
+
+? 落地机链接（回车改为手填）: ← 粘贴
+ 落地地址      1.2.3.4:58443 (UDP)
+ 密码          ****
+ SNI           1.2.3.4
+ pinSHA256     350bc6eb...
+ 混淆          salamander / ****
+? 本机监听端口 [58443]: ← 回车用同一个端口，或自己填一个
+? 名字（字母数字，用于区分多条） [1-2-3-4]:
+```
+
+回车之后 VPS2 会打印一条**新链接**，把它导入客户端就完事了。
+
+**③ 客户端**：用新链接替换旧的。
+
+### 为什么客户端不用改其它参数
+
+`hysteria2://` 链接里只有「地址:端口」被换成了 VPS2 的，`sni`、`pinSHA256`、`obfs-password` 一个都没动。因为 TLS 握手和混淆都是**客户端 ↔ 落地机**的端到端行为，中转机只看 UDP 五元组，看不懂也不该看懂里面是什么。
+
+### 命令
+
+```bash
+hy2 relay add --link 'hysteria2://...' --listen 20001 --name hk   # 加一条
+hy2 relay list --links     # 列表 + 全部中转链接
+hy2 relay link hk          # 只看某一条的链接
+hy2 relay edit hk          # 改端口 / 备注 / 启停
+hy2 relay del hk           # 删除（只删本机规则，不动落地机）
+hy2 relay apply            # 规则被人清掉了，重新下发
+hy2 relay diag             # 排障：看每条规则命中了多少包
+```
+
+### 实现方式与理由
+
+用的是 **iptables 的 DNAT + MASQUERADE**，不是 realm / gost / nginx：
+
+- Hysteria2 只有 QUIC(UDP)，内核转发是零拷贝，不引入用户态进程，也不多一跳延迟
+- 规则活在 netfilter 里，代理进程被 OOM 杀掉、崩溃重启都不会断流
+- 中转机不用装 Hysteria，转发和服务端完全解耦，落地机换系统也不影响
+
+规则写在自定义链 `HY2R_PRE` / `HY2R_POST` 里，**只动自己的链，不碰系统上已有的规则**。每次修改都会把整份规则重新渲染成 `/etc/hy2-relay/apply.sh` 再执行，所以规则永远和配置一致，不会出现残留。这个脚本同时被开机自启服务调用——即使脚本本体被删了，重启后规则照样恢复。
+
+**只做 DNAT 不行**：落地机看到的源地址会是真实客户端 IP，回包绕过中转机直接发给客户端；而客户端 socket 连的是中转机，源地址对不上就被内核丢掉，表现是「握手成功，一发数据就卡死」。加上 MASQUERADE 后回程才会走回中转机。
+
+### 四个要注意的地方
+
+| 事项 | 说明 |
+|---|---|
+| 安全组 | 中转机放行 **UDP 监听端口**，落地机放行 **UDP 原端口**，云厂商控制台各看一遍 |
+| 落地机不能停 | 中转只是转发，VPS1 上的 Hysteria 停了，两边一起断 |
+| 客户端 IP 变了 | 落地机看到的都是中转机 IP，按 IP 限速/计费的功能会失效 |
+| 只有 UDP | Hysteria2 是纯 UDP 协议，转发也只转 UDP；**端口跳跃（mport）会失效**，中转只认单端口 |
+
+**连不上怎么查**：在 VPS2 上 `hy relay diag`，看 `HY2R_PRE` 的包数。
+
+- 包数是 0 → 客户端连的地址/端口不对，或 VPS2 安全组没放行
+- 包数在涨但连不上 → VPS1 没放行 UDP，或 VPS1 上服务没起（`hy status` 看）
+- 两边都正常还是断 → 多半是客户端缓存了旧链接，删掉节点重新导入
+
 ## 文件清单
 
 | 路径 | 说明 |
 |---|---|
 | `/usr/local/bin/hysteria` | 二进制 |
+| `/usr/local/bin/hy` `/usr/local/bin/hy2` | 管理命令（`hy` 进菜单，`hy2` 走子命令） |
 | `/etc/hysteria/config.yaml` | 服务端配置（mode 600） |
 | `/etc/hysteria/cert.pem` `.key.pem` | 自签证书（仅自签模式） |
 | `/etc/hysteria/.install.meta` | 安装信息，供 `info` 使用 |
+| `/etc/hy2-relay/nodes/*.conf` | 中转规则，一条一个文件（mode 600） |
+| `/etc/hy2-relay/apply.sh` `clear.sh` | 由配置渲染出的 iptables 脚本，开机自启调用 |
 | `/etc/systemd/system/hysteria-server.service` | systemd 单元（systemd 系统） |
 | `/etc/init.d/hysteria-server` | OpenRC 服务脚本（Alpine / Gentoo） |
+| `/etc/systemd/system/hy2-relay.service` | 中转规则的开机自启（有转发时，systemd） |
+| `/etc/init.d/hy2-relay` | 中转规则的开机自启（有转发时，OpenRC） |
 | `/var/log/hysteria.log` | 服务输出日志（仅 OpenRC，systemd 走 journald） |
 | `/etc/sysctl.d/99-hysteria.conf` | 内核调优（存在则跳过） |
+| `/etc/sysctl.d/99-hy2-relay.conf` | 转发开关 + conntrack 超时（有转发时） |
 
-卸载会清掉以上全部内容。二进制从 GitHub Releases 下载，失败自动切官方加速域名 `download.hysteria.network`。
+卸载会清掉以上全部内容（`uninstall` 不管中转规则，用 `hy relay clear` 单独清）。二进制从 GitHub Releases 下载，失败自动切官方加速域名 `download.hysteria.network`。
 
 ## 常见问题
 
@@ -377,6 +489,18 @@ rc-service hysteria-server start    # 前台看报错
 
 **Alpine 重启后内核参数丢了**
 脚本会把配置追加到 `/etc/sysctl.conf`，但要确保 `sysctl` 服务在默认运行级：`rc-update add sysctl default`。没装 `procps` 时脚本直接写 `/proc`，重启后需要 sysctl 服务重新加载。
+
+**中转加了以后，落地机的链接还能用吗**
+能，两条都能用。中转只是多开一个入口，落地机上的服务和链接一点没变，想直连就直连，想走中转就导入新链接。
+
+**中转链接连不上，直连落地机正常**
+按顺序查三件事：① 客户端里是不是还留着旧节点，删掉重新导入；② VPS2 的安全组放行 UDP 监听端口了没；③ `hy relay diag` 看包数——一直 0 说明包根本没到 VPS2，在涨说明问题在 VPS1 那一侧（安全组或服务没起）。
+
+**中转机会不会很吃 CPU**
+不会。转发走的是内核 netfilter，不进用户态，也不做加解密（TLS 是客户端和落地机端到端握的，中转机看不懂）。一台 1 核小机器跑几条规则没有可感负载，瓶颈只在中转机的带宽。
+
+**能不能多层中转（VPS3 → VPS2 → VPS1）**
+可以，把 VPS2 生成的中转链接拿到 VPS3 上再 `hy relay add` 一次即可，每层只是把上一层的地址当成落地地址。但每加一层就多一次转发，延迟和故障点都跟着涨，一般两层够用。
 
 ## 免责声明
 
