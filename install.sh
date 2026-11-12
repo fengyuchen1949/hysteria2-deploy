@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  Hysteria2 一键部署脚本（裸机 / systemd，非 Docker）
+#  Hysteria2 一键部署脚本（裸机 / systemd 或 OpenRC，非 Docker）
 #
 #  适用系统：Debian 11+ / Ubuntu 20.04+ / Rocky 8+ / CentOS Stream 8+ / Fedora 37+
+#           Alpine 3.18+（OpenRC）
+#  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
 #  脚本版本：1.0.0
 #
@@ -18,11 +20,19 @@
 #  脚本只会改动这些路径：
 #    /usr/local/bin/hysteria
 #    /etc/hysteria/{config.yaml,cert.pem,key.pem,.install.meta}
-#    /etc/systemd/system/hysteria-server.service
+#    /etc/systemd/system/hysteria-server.service   （systemd）
+#    /etc/init.d/hysteria-server                   （OpenRC）
+#    /var/log/hysteria.log                         （OpenRC 下的输出日志）
 #    /etc/sysctl.d/99-hysteria.conf
 # ==============================================================================
 
 set -Eeuo pipefail
+
+# Alpine 的 busybox ash 不支持 [[ ]] 与数组，必须用 bash 运行
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "[×] 本脚本需要 bash。Alpine 请先执行：apk add bash" >&2
+  exit 1
+fi
 
 SCRIPT_VERSION="1.0.0"
 
@@ -31,9 +41,11 @@ HY2_BIN="/usr/local/bin/hysteria"
 HY2_DIR="/etc/hysteria"
 HY2_CONF="${HY2_DIR}/config.yaml"
 META="${HY2_DIR}/.install.meta"
-UNIT="/etc/systemd/system/hysteria-server.service"
+UNIT=""                     # 服务文件路径，由 detect_init 按实际 init 系统决定
+INIT_SYS=""                 # systemd / openrc / none
 SYSCTL_FILE="/etc/sysctl.d/99-hysteria.conf"
 SVC="hysteria-server"
+LOG_FILE="/var/log/hysteria.log"   # OpenRC 下的输出日志
 
 PORT="${PORT:-443}"
 DOMAIN=""
@@ -76,7 +88,8 @@ has() { command -v "$1" >/dev/null 2>&1; }
 is_ip() { [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || [[ "$1" == *:* ]]; }
 
 pkg_mgr() {
-  if has apt-get; then echo apt
+  if has apk; then echo apk
+  elif has apt-get; then echo apt
   elif has dnf; then echo dnf
   elif has yum; then echo yum
   elif has zypper; then echo zypper
@@ -97,6 +110,12 @@ pkg_install() {
     dnf) dnf install -y -q "${missing[@]}" >/dev/null 2>&1 || true ;;
     yum) yum install -y -q "${missing[@]}" >/dev/null 2>&1 || true ;;
     zypper) zypper -q install -y "${missing[@]}" >/dev/null 2>&1 || true ;;
+    apk)
+      # Alpine：先试 --no-cache（快），失败再 update 后重试
+      if ! apk add --no-cache "${missing[@]}" >/dev/null 2>&1; then
+        apk update >/dev/null 2>&1 || true
+        apk add "${missing[@]}" >/dev/null 2>&1 || true
+      fi ;;
     *) warn "未识别的包管理器，请手动安装：${missing[*]}" ;;
   esac
 }
@@ -153,7 +172,7 @@ set_masq() { # 解析 --masquerade 的取值
 
 usage() {
   cat <<'EOF'
-Hysteria2 一键部署脚本
+Hysteria2 一键部署脚本（systemd / OpenRC）
 
 命令（默认 install）：
   install        安装 / 重装
@@ -163,6 +182,12 @@ Hysteria2 一键部署脚本
   restart        重启服务
   upgrade        升级到最新版本
   uninstall      卸载（含服务与配置）
+
+支持的系统：
+  Debian / Ubuntu / Rocky / CentOS Stream / Fedora   systemd
+  Alpine / Gentoo                                     OpenRC
+  OpenWrt（procd）与纯容器                            请改用 Docker
+  Alpine 需先执行 apk add bash
 
 选项：
   --domain <域名>        域名 + ACME 自动证书（需解析到本机）
@@ -245,6 +270,87 @@ detect_pubip() {
 }
 
 rand_hex() { openssl rand -hex "${1:-16}" 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32; }
+
+# ------------------------------ init 系统适配 ------------------------------
+# 支持 systemd 与 OpenRC（Alpine / Gentoo）。OpenWrt 的 procd 不在支持范围内。
+detect_init() {
+  if has systemctl && [ -d /run/systemd/system ]; then
+    INIT_SYS="systemd"; UNIT="/etc/systemd/system/${SVC}.service"
+  elif has rc-service && has rc-update && [ -d /etc/init.d ]; then
+    INIT_SYS="openrc";  UNIT="/etc/init.d/${SVC}"
+  else
+    INIT_SYS="none";    UNIT=""
+  fi
+}
+
+svc_enable() {
+  case "$INIT_SYS" in
+    systemd) systemctl enable "$SVC" >/dev/null 2>&1 || true ;;
+    openrc)  rc-update add "$SVC" default >/dev/null 2>&1 || true ;;
+  esac
+}
+svc_start() {
+  case "$INIT_SYS" in
+    systemd) systemctl start "$SVC" ;;
+    openrc)  rc-service "$SVC" start ;;
+  esac
+}
+svc_stop() {
+  case "$INIT_SYS" in
+    systemd) systemctl stop "$SVC" 2>/dev/null || true ;;
+    openrc)  rc-service "$SVC" stop 2>/dev/null || true ;;
+  esac
+}
+svc_restart() {
+  case "$INIT_SYS" in
+    systemd) systemctl restart "$SVC" ;;
+    openrc)  rc-service "$SVC" restart ;;
+  esac
+}
+svc_active() {
+  case "$INIT_SYS" in
+    systemd) systemctl is-active --quiet "$SVC" ;;
+    openrc)  rc-service "$SVC" status >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+svc_status() {
+  case "$INIT_SYS" in
+    systemd) systemctl status "$SVC" --no-pager -l ;;
+    openrc)  rc-service "$SVC" status ;;
+  esac
+}
+svc_logs() {
+  local n="${1:-25}"
+  case "$INIT_SYS" in
+    systemd) journalctl --no-pager -n "$n" -u "$SVC" ;;
+    openrc)  tail -n "$n" "$LOG_FILE" 2>/dev/null || echo "（暂无日志文件 ${LOG_FILE}）" ;;
+  esac
+}
+svc_log_follow() {
+  case "$INIT_SYS" in
+    systemd) journalctl -u "$SVC" -f --no-pager ;;
+    openrc)  tail -f "$LOG_FILE" ;;
+  esac
+}
+svc_log_hint() {
+  case "$INIT_SYS" in
+    systemd) echo "journalctl -u ${SVC} -f" ;;
+    openrc)  echo "tail -f ${LOG_FILE}" ;;
+  esac
+}
+svc_restart_hint() {
+  case "$INIT_SYS" in
+    openrc) echo "rc-service ${SVC} restart" ;;
+    *) echo "systemctl restart ${SVC}" ;;
+  esac
+}
+svc_status_hint() {
+  case "$INIT_SYS" in
+    openrc) echo "rc-service ${SVC} status" ;;
+    *) echo "systemctl status ${SVC}" ;;
+  esac
+}
 
 # ------------------------------ 伪装站点 ------------------------------
 # 候选池筛选标准：全球有 CDN、无反爬挑战、首页体积可控、内容中性（不涉及敏感题材）
@@ -362,7 +468,7 @@ write_config() {
     echo "# Hysteria2 服务端配置"
     echo "# 生成时间：$(date '+%Y-%m-%d %H:%M:%S')   脚本版本：${SCRIPT_VERSION}"
     echo "# 文档：https://v2.hysteria.network/zh/docs/"
-    echo "# 改完执行：systemctl restart ${SVC}"
+    echo "# 改完执行：$(svc_restart_hint)"
     echo "# ============================================================"
     echo
     echo "listen: :${PORT}"
@@ -439,6 +545,14 @@ write_config() {
 }
 
 write_service() {
+  case "$INIT_SYS" in
+    systemd) write_systemd_unit ;;
+    openrc)  write_openrc_service ;;
+    *) die "未知的 init 系统，无法写入服务文件" ;;
+  esac
+}
+
+write_systemd_unit() {
   cat > "$UNIT" <<EOF
 [Unit]
 Description=Hysteria2 Server
@@ -466,12 +580,44 @@ EOF
   ok "systemd 服务已写入 ${UNIT}"
 }
 
+write_openrc_service() {
+  # supervise-daemon 由 OpenRC 0.42+ 提供，负责拉起与崩溃重启
+  cat > "$UNIT" <<EOF
+#!/sbin/openrc-run
+
+name="Hysteria2 Server"
+description="Hysteria2 proxy server"
+
+supervisor="supervise-daemon"
+command="${HY2_BIN}"
+command_args="server -c ${HY2_CONF}"
+command_user="root:root"
+directory="${HY2_DIR}"
+pidfile="/run/\${RC_SVCNAME}.pid"
+
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
+respawn_delay=5
+respawn_max=0
+rc_ulimit="-n 1048576"
+
+depend() {
+    need net
+    after firewall
+}
+EOF
+  chmod +x "$UNIT"
+  : > "$LOG_FILE" 2>/dev/null || true
+  ok "OpenRC 服务已写入 ${UNIT}"
+}
+
 tune_sysctl() {
+  mkdir -p "$(dirname "$SYSCTL_FILE")" 2>/dev/null || true
+
   if [ -f "$SYSCTL_FILE" ]; then
-    info "内核参数已存在，跳过：${SYSCTL_FILE}"
-    return 0
-  fi
-  cat > "$SYSCTL_FILE" <<'EOF'
+    info "内核参数文件已存在，跳过写入：${SYSCTL_FILE}"
+  else
+    cat > "$SYSCTL_FILE" <<'EOF'
 # Hysteria2 / QUIC 调优
 # hy2 走 QUIC 自带拥塞控制，tcp_congestion_control 只影响 TCP（ACME、伪装回源）
 # 真正对 QUIC 有用的是 fq 与放大的 UDP 缓冲区
@@ -482,8 +628,29 @@ net.core.wmem_max = 16777216
 net.core.rmem_default = 1048576
 net.core.wmem_default = 1048576
 EOF
-  sysctl --system >/dev/null 2>&1 || true
-  ok "内核调优已写入（fq + BBR + UDP 缓冲 16MB）"
+    ok "内核参数已写入 ${SYSCTL_FILE}"
+  fi
+
+  # 立即生效：有 sysctl 命令就用它；Alpine 未装 procps 时直接写 /proc
+  if has sysctl; then
+    sysctl -p "$SYSCTL_FILE" >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+  else
+    local k v kp
+    grep -E '^[[:space:]]*net\.' "$SYSCTL_FILE" 2>/dev/null | while IFS='=' read -r k v; do
+      k="$(printf '%s' "$k" | tr -d '[:space:]')"
+      v="$(printf '%s' "$v" | tr -d '[:space:]')"
+      [ -n "$k" ] || continue
+      kp="/proc/sys/$(printf '%s' "$k" | tr '.' '/')"
+      [ -w "$kp" ] && printf '%s' "$v" > "$kp" 2>/dev/null
+    done || true
+  fi
+
+  # OpenRC 的 sysctl 服务不一定读 sysctl.d，追加一份到 sysctl.conf 保证重启后生效
+  if [ "$INIT_SYS" = "openrc" ] && [ -f /etc/sysctl.conf ] && ! grep -q '99-hysteria' /etc/sysctl.conf 2>/dev/null; then
+    { echo; echo "# --- hysteria2-deploy ---"; grep -E '^[[:space:]]*net\.' "$SYSCTL_FILE" 2>/dev/null; } >> /etc/sysctl.conf 2>/dev/null || true
+  fi
+
+  ok "内核调优已应用（fq + BBR + UDP 缓冲 16MB）"
 }
 
 open_firewall() {
@@ -641,7 +808,7 @@ print_info() {
   printf '}\n'
   hr
   echo
-  info "配置文件：${HY2_CONF}    服务：systemctl status ${SVC}"
+  info "配置文件：${HY2_CONF}    服务：$(svc_status_hint)"
 }
 
 # ------------------------------ 安装向导 ------------------------------
@@ -692,7 +859,9 @@ collect_config() {
 
     local resolved=""
     if has getent; then
+      # musl（Alpine）的 getent 不一定支持 ahosts，回落到 hosts
       resolved="$(getent ahosts "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+      [ -z "$resolved" ] && resolved="$(getent hosts "$DOMAIN" 2>/dev/null | awk 'NR==1{print $1}' || true)"
       if [ -z "$resolved" ]; then
         warn "域名 ${DOMAIN} 当前解析不到，ACME 会失败"
       elif [ -n "$pubip" ] && [ "$resolved" != "$pubip" ]; then
@@ -793,7 +962,10 @@ show_summary() {
 # ------------------------------ 安装主流程 ------------------------------
 do_install() {
   need_root
-  has systemctl || die "未检测到 systemd，本脚本不支持 OpenWrt / Alpine"
+  detect_init
+  if [ "$INIT_SYS" = "none" ]; then
+    die "未检测到 systemd 或 OpenRC。OpenWrt（procd）与纯容器请改用 Docker 部署"
+  fi
 
   echo
   hr
@@ -838,15 +1010,15 @@ do_install() {
   [ "$TUNE" -eq 1 ] && tune_sysctl || info "跳过内核调优"
 
   step "启动服务"
-  systemctl enable "$SVC" >/dev/null 2>&1 || true
-  systemctl restart "$SVC"
+  svc_enable
+  svc_restart
   sleep 3
 
-  if systemctl is-active --quiet "$SVC"; then
-    ok "服务已运行"
+  if svc_active; then
+    ok "服务已运行（${INIT_SYS}）"
   else
     warn "服务未正常运行，最近日志："
-    journalctl --no-pager -n 25 -u "$SVC" || true
+    svc_logs 25 || true
     die "启动失败。常见原因：端口被占 / 域名未解析 / 证书路径错误"
   fi
 
@@ -867,22 +1039,23 @@ do_install() {
   save_meta
 
   print_info
-  ok "部署完成。日志：journalctl -u ${SVC} -f"
+  ok "部署完成。日志：$(svc_log_hint)"
 }
 
 do_upgrade() {
   need_root
+  detect_init
   [ -f "$META" ] || die "未找到安装信息 ${META}，请先执行 install"
   # shellcheck disable=SC1090
   . "$META"
   PINNED_VERSION="latest"
   install_binary
-  systemctl restart "$SVC"
+  svc_restart
   sleep 2
-  if systemctl is-active --quiet "$SVC"; then
+  if svc_active; then
     ok "升级完成：$(get_version)"
   else
-    warn "服务未启动，执行 journalctl -u ${SVC} -n 30 查看"
+    warn "服务未启动，执行 $(svc_log_hint) 查看"
   fi
   M_VER="$(get_version)"
   save_meta
@@ -890,24 +1063,32 @@ do_upgrade() {
 
 do_uninstall() {
   need_root
+  detect_init
   warn "将停止并删除：${HY2_BIN}、${HY2_DIR}、${UNIT}"
   confirm "确认卸载？" "n" || { info "已取消"; exit 0; }
-  systemctl stop "$SVC" 2>/dev/null || true
-  systemctl disable "$SVC" 2>/dev/null || true
-  rm -f "$UNIT"
-  systemctl daemon-reload
+  svc_stop
+  case "$INIT_SYS" in
+    systemd)
+      systemctl disable "$SVC" >/dev/null 2>&1 || true
+      rm -f "$UNIT"
+      systemctl daemon-reload ;;
+    openrc)
+      rc-update del "$SVC" default >/dev/null 2>&1 || true
+      rm -f "$UNIT" ;;
+  esac
   rm -rf "$HY2_DIR"
   rm -f "$HY2_BIN"
   rm -f "$SYSCTL_FILE"
+  rm -f "$LOG_FILE" 2>/dev/null || true
   ok "已卸载（防火墙规则请按需手动清理）"
 }
 
 case "$ACTION" in
   install)   do_install ;;
-  info)      need_root; print_info ;;
-  status)    systemctl status "$SVC" --no-pager -l ;;
-  log)       journalctl -u "$SVC" -f --no-pager ;;
-  restart)   need_root; systemctl restart "$SVC" && ok "已重启" ;;
+  info)      need_root; detect_init; print_info ;;
+  status)    detect_init; svc_status ;;
+  log)       detect_init; svc_log_follow ;;
+  restart)   need_root; detect_init; if svc_restart; then ok "已重启"; else die "重启失败"; fi ;;
   upgrade)   do_upgrade ;;
   uninstall) do_uninstall ;;
 esac

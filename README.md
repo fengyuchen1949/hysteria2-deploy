@@ -1,22 +1,42 @@
 # Hysteria2 一键部署脚本
 
-裸机（systemd）部署 [Hysteria2](https://v2.hysteria.network/) 的交互式安装脚本。不依赖 Docker，不碰系统已有服务，装完直接输出可导入的分享链接。
+裸机部署 [Hysteria2](https://v2.hysteria.network/) 的交互式安装脚本，支持 systemd 与 OpenRC。不依赖 Docker，不碰系统已有服务，装完直接输出可导入的分享链接。
 
 ![version](https://img.shields.io/badge/Hysteria-v2.13.x-blue)
-![platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Rocky%20%7C%20Fedora-lightgrey)
+![platform](https://img.shields.io/badge/platform-Debian%20%7C%20Ubuntu%20%7C%20Rocky%20%7C%20Fedora%20%7C%20Alpine-lightgrey)
 ![license](https://img.shields.io/badge/license-MIT-green)
 
 ## 特性
 
 - **完整交互向导**：地址 → 端口 → 证书方式 → 密码 → 混淆 → 伪装/调优，六步问完自动装
 - **伪装站点自动探测**：内置 7 个候选站并行测速选最快，也可随机 / 关闭 / 手填
-- **自动装依赖**：apt / dnf / yum / zypper 全部适配，缺什么装什么
+- **自动装依赖**：apt / dnf / yum / zypper / apk 全部适配，缺什么装什么
 - **两种证书模式**：域名 ACME 自动签发，或自签 + pinSHA256（无需域名）
-- **开机自启**：systemd 服务，`Restart=on-failure`，`LimitNOFILE=1048576`
+- **双 init 系统**：systemd（Debian/Ubuntu/RHEL）与 OpenRC（Alpine/Gentoo），都带开机自启和崩溃重启
 - **自动放行防火墙**：ufw / firewalld / iptables 自动识别
 - **内核调优**：fq + BBR + 16MB UDP 缓冲区（已存在则跳过，不覆盖）
 - **装完即用**：输出 `hysteria2://` 链接、Clash Meta 片段、sing-box outbound、终端二维码
 - **可管理**：`info / status / log / restart / upgrade / uninstall`
+
+## 支持的系统
+
+| 系统 | init | 状态 |
+|---|---|---|
+| Debian 11+ / Ubuntu 20.04+ | systemd | 直接支持 |
+| Rocky 8+ / CentOS Stream 8+ / Fedora 37+ | systemd | 直接支持 |
+| Alpine 3.18+ | OpenRC | 直接支持 |
+| Gentoo | OpenRC | 理论支持，未实测 |
+| OpenWrt | procd | **不支持**，用 Docker |
+| Docker / LXC 纯容器 | 无 init | **不支持**，用 Docker |
+
+Alpine 默认只有 busybox ash，**必须先装 bash**：
+
+```sh
+apk add bash
+bash <(curl -fsSL https://raw.githubusercontent.com/fengyuchen1949/hysteria2-deploy/main/install.sh)
+```
+
+> Hysteria 官方 release 是 Go 静态链接（无 `PT_INTERP`），musl 上可直接运行，不需要装 glibc 兼容层。
 
 ## 一键安装
 
@@ -252,12 +272,19 @@ bash install.sh upgrade    # 升级到最新版
 bash install.sh uninstall  # 卸载
 ```
 
-或直接用 systemd：
+或直接用原生服务管理命令：
 
 ```bash
+# systemd
 systemctl status hysteria-server
 journalctl -u hysteria-server -f
+
+# OpenRC（Alpine）
+rc-service hysteria-server status
+tail -f /var/log/hysteria.log
 ```
+
+脚本会自动识别当前 init 系统，`status` / `log` / `restart` 这些子命令内部会调用对应的工具，不用你自己判断。
 
 ## 文件清单
 
@@ -267,7 +294,9 @@ journalctl -u hysteria-server -f
 | `/etc/hysteria/config.yaml` | 服务端配置（mode 600） |
 | `/etc/hysteria/cert.pem` `.key.pem` | 自签证书（仅自签模式） |
 | `/etc/hysteria/.install.meta` | 安装信息，供 `info` 使用 |
-| `/etc/systemd/system/hysteria-server.service` | systemd 单元 |
+| `/etc/systemd/system/hysteria-server.service` | systemd 单元（systemd 系统） |
+| `/etc/init.d/hysteria-server` | OpenRC 服务脚本（Alpine / Gentoo） |
+| `/var/log/hysteria.log` | 服务输出日志（仅 OpenRC，systemd 走 journald） |
 | `/etc/sysctl.d/99-hysteria.conf` | 内核调优（存在则跳过） |
 
 卸载会清掉以上全部内容。二进制从 GitHub Releases 下载，失败自动切官方加速域名 `download.hysteria.network`。
@@ -298,9 +327,22 @@ UDP 端口被占用：`ss -lunp | grep 443`，换端口重装。
 **伪装站点打开后是 404 / 空白页**
 ```bash
 curl -I https://你的伪装站点/     # 在 VPS 上测回源是否正常
-journalctl -u hysteria-server -n 30 | grep -i masquerade
 ```
-多半是目标站点变更了反爬策略，换一个：`bash install.sh --force --masquerade random`。
+systemd 用 `journalctl -u hysteria-server -n 30 | grep -i masquerade`，OpenRC 用 `tail -n 30 /var/log/hysteria.log`。多半是目标站点变更了反爬策略，换一个：`bash install.sh --force --masquerade random`。
+
+**Alpine 报 `bash: not found`**
+Alpine 默认只有 busybox ash。先 `apk add bash` 再跑脚本。
+
+**Alpine 上服务起不来**
+```sh
+rc-service hysteria-server status
+tail -n 50 /var/log/hysteria.log
+rc-service hysteria-server start    # 前台看报错
+```
+常见原因：`supervise-daemon` 缺失（OpenRC < 0.42，升级 openrc 包）、`/var/log` 不可写、二进制架构不匹配。
+
+**Alpine 重启后内核参数丢了**
+脚本会把配置追加到 `/etc/sysctl.conf`，但要确保 `sysctl` 服务在默认运行级：`rc-update add sysctl default`。没装 `procps` 时脚本直接写 `/proc`，重启后需要 sysctl 服务重新加载。
 
 ## 免责声明
 
