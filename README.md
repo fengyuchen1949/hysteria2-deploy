@@ -192,6 +192,8 @@ bash install.sh --masquerade auto    # 自动探测
 bash install.sh --masquerade random  # 随机
 bash install.sh --masquerade none    # 关闭
 bash install.sh --masquerade https://www.example.com/   # 手动
+
+bash install.sh masq auto            # 装完只想改伪装，用 masq，不重装、不换密码证书
 ```
 
 ### 探测具体做了什么
@@ -288,6 +290,7 @@ proxies:
 
 ```bash
 bash install.sh info       # 重新打印节点信息与链接
+bash install.sh masq auto  # 只换伪装站点：auto/random/none/<URL>，密码与证书不变
 bash install.sh status     # 服务状态
 bash install.sh log        # 实时日志
 bash install.sh restart    # 重启
@@ -346,6 +349,11 @@ UDP 端口被占用：`ss -lunp | grep 443`，换端口重装。
 
 **伪装站点自动探测全部失败**
 说明 VPS 出网被限制（少见，通常是内网机器或 DNS 坏了）。脚本会自动回落到 `https://www.bing.com/`。想彻底避免回源请求，用 `--masquerade none`。
+
+**链接里的 `sni` 是服务器 IP，是不是伪装站点没填进去？**
+不是。`masquerade` 是纯服务端配置，`hysteria2://` 链接里没有这个字段——任何脚本生成的链接都没有。`sni` 是 TLS 服务器名，自签 + `sniGuard: disable` 时填 IP 完全正常；想让它看起来像在访问某个域名，用 `--sni www.apple.com`。
+
+伪装站点是否生效只看两处：`bash install.sh info` 的「伪装站点」一行（读的是 `config.yaml`，不是安装记录），以及浏览器打开 `https://你的IP:端口/` 是否显示那个网站。改它用 `bash install.sh masq auto`，不用重装。
 
 **伪装站点能填自己的 IP 吗**
 不能。别人用浏览器访问你的端口时，Hysteria 会把请求反向代理到伪装站点；填自己的地址等于自己代理自己，稳定 502，比不配（直接 404）更容易露馅。脚本现在会直接拦掉这种填写。换成任意正常网站，或者选 4 关闭——**伪装关掉不影响节点可用性**。

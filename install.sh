@@ -6,7 +6,7 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.0.3
+#  脚本版本：1.0.4
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
@@ -34,7 +34,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-SCRIPT_VERSION="1.0.3"
+SCRIPT_VERSION="1.0.4"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -231,6 +231,7 @@ Hysteria2 一键部署脚本（systemd / OpenRC）
 命令（默认 install）：
   install        安装 / 重装
   info           打印节点信息与分享链接
+  masq [值]      只换伪装站点：auto / random / none / <URL>，不动密码与证书
   status         查看服务状态
   log            查看实时日志
   restart        重启服务
@@ -267,6 +268,7 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     install|info|status|log|restart|upgrade|uninstall) ACTION="$1"; shift ;;
+    masq)            ACTION="masq"; shift ;;
     --domain)        DOMAIN="${2:-}"; MODE="acme"; MODE_SET=1; shift 2 ;;
     --email)         EMAIL="${2:-}"; shift 2 ;;
     --ip|--selfsigned) MODE="selfsigned"; MODE_SET=1; shift ;;
@@ -288,7 +290,10 @@ while [ $# -gt 0 ]; do
     --yes|-y)        ASSUME_YES=1; shift ;;
     --force)         FORCE=1; shift ;;
     -h|--help)       usage; exit 0 ;;
-    *) die "未知参数：$1（--help 查看帮助）" ;;
+    -*) die "未知参数：$1（--help 查看帮助）" ;;
+    *)  # masq 后面可以直接跟值：masq auto / masq none / masq https://...
+      if [ "$ACTION" = "masq" ]; then set_masq "$1"; shift
+      else die "未知参数：$1（--help 查看帮助）"; fi ;;
   esac
 done
 
@@ -420,6 +425,14 @@ MASQ_POOL=(
   "https://www.163.com/"
 )
 MASQ_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# 从 URL 取 host，顺便去掉尾部 :端口（伪装站和节点同端口，用户常把端口也写进去）
+url_host() {
+  local h="${1#*://}"
+  h="${h%%/*}"
+  [ -n "${2:-}" ] && h="${h%:$2}"
+  printf '%s' "$h"
+}
 
 # 探测单个站点：可达且内容正常时输出「耗时秒 字节数」，否则返回非 0
 probe_masq() {
@@ -775,6 +788,47 @@ load_meta() {
   . "$META"
 }
 
+# 读 config.yaml 里 masquerade.proxy.url —— 这是伪装站点唯一的真实来源
+config_masq_url() {
+  [ -f "$HY2_CONF" ] || return 0
+  local u=""
+  u="$(awk '
+    /^masquerade:[[:space:]]*$/ { inb = 1; next }
+    inb && /^[[:space:]]+url:/ {
+      sub(/^[[:space:]]+url:[[:space:]]*/, "")
+      print
+      exit
+    }
+    inb && /^[^[:space:]]/ { inb = 0 }
+  ' "$HY2_CONF")"
+  u="${u%\"}"; u="${u#\"}"
+  printf '%s' "$u"
+}
+
+# 替换 config.yaml 的 masquerade 段（$1 为空 = 删掉，端口直接返回 404）
+rewrite_masq() {
+  local url="$1" tmp
+  tmp="$(mktemp)"
+  awk '
+    /^masquerade:[[:space:]]*$/ { skip = 1; next }
+    skip && /^[[:space:]]/      { next }
+    skip                        { skip = 0 }
+    { print }
+  ' "$HY2_CONF" > "$tmp"
+  if [ -n "$url" ]; then
+    {
+      printf '\nmasquerade:\n'
+      printf '  type: proxy\n'
+      printf '  proxy:\n'
+      printf '    rewriteHost: true\n'
+      printf '    url: %s\n' "$url"
+    } >> "$tmp"
+  fi
+  # 用 cat 回写而不是 mv：保留原文件的权限与 inode
+  cat "$tmp" > "$HY2_CONF"
+  rm -f "$tmp" 2>/dev/null || true
+}
+
 # ------------------------------ 分享链接 ------------------------------
 uri_enc() {
   local s="$1" out="" c i
@@ -805,7 +859,7 @@ build_uri() {
 
 print_info() {
   load_meta
-  local host="${M_HOST:-${M_DOMAIN:-}}" sni="" insecure=0 pin="" uri=""
+  local host="${M_HOST:-${M_DOMAIN:-}}" sni="" insecure=0 pin="" uri="" masq=""
   if [ "${M_MODE:-}" = "acme" ]; then
     sni="${M_DOMAIN}"; insecure=0
   else
@@ -841,8 +895,19 @@ print_info() {
   fi
   [ -n "${M_OBFS:-}" ] && kv "混淆          " "salamander / ${M_OBFS}"
   [ -n "$pin" ] && kv "pinSHA256     " "${pin}"
-  [ -n "${M_MASQ:-}" ] && kv "伪装站点      " "${M_MASQ}"
+  # 伪装站点以 config.yaml 为准：meta 可能滞后（用户手改过配置或旧的 --masquerade）
+  masq="$(config_masq_url)"
+  [ -z "$masq" ] && masq="${M_MASQ:-}"
+  if [ -n "$masq" ]; then
+    kv "伪装站点      " "${masq}"
+  else
+    kv "伪装站点      " "未配置（直接访问端口返回 404）"
+  fi
   hr
+  hint "伪装站点只在服务端生效，分享链接里没有这个字段；sni 是 TLS 服务器名，不是伪装网址"
+  if [ -n "$masq" ] && [ "$(url_host "$masq" "${M_PORT:-}")" = "${M_HOST:-}" ]; then
+    warn "伪装站点指向本机，反代会回环 502；执行 bash install.sh masq auto 修复"
+  fi
   echo
   printf '%s分享链接%s\n' "$C_B" "$C_0"
   printf '%s\n' "$uri"
@@ -1009,9 +1074,8 @@ collect_config() {
         *) die "伪装 URL 需以 http:// 或 https:// 开头" ;;
       esac
       # 指向本机 = 反向代理的请求又回到自己，稳定 502，比不配伪装还假
-      local mhost="${MASQ_URL#*://}"
-      mhost="${mhost%%/*}"
-      mhost="${mhost%:${PORT}}"
+      local mhost
+      mhost="$(url_host "$MASQ_URL" "$PORT")"
       if [ "$mhost" = "$HOST" ] || { [ -n "$pubip" ] && [ "$mhost" = "$pubip" ]; }; then
         die "伪装站点不能填服务器自己的地址（反代会回环成 502），换成正常网站；不在乎伪装就选 4"
       fi ;;
@@ -1162,6 +1226,50 @@ do_upgrade() {
   save_meta
 }
 
+# 只改伪装站点：不碰端口/密码/证书，客户端已导入的节点不用换
+do_masq() {
+  need_root
+  detect_init
+  [ -f "$HY2_CONF" ] || die "未找到 ${HY2_CONF}，请先执行 install"
+  [ "$MASQ_MODE_SET" -eq 1 ] || die "用法：bash install.sh masq auto | random | none | <URL>"
+  load_meta
+
+  local url="$MASQ_URL" mhost=""
+  case "$MASQ_MODE" in
+    auto)
+      info "探测候选站点可用性（并行，最多约 6 秒）"
+      url="$(pick_masq_auto)"
+      if [ -z "$url" ]; then
+        url="https://www.bing.com/"
+        warn "候选站点全部不可达（VPS 出网受限？），回落到 ${url}"
+      fi ;;
+    random)
+      url="$(pick_masq_random)" ;;
+    none)
+      url="" ;;
+    manual)
+      case "$url" in
+        http://*|https://*) ;;
+        *) die "伪装 URL 需以 http:// 或 https:// 开头" ;;
+      esac
+      mhost="$(url_host "$url" "${M_PORT:-}")"
+      if [ "$mhost" = "${M_HOST:-}" ] || { [ -n "${M_DOMAIN:-}" ] && [ "$mhost" = "$M_DOMAIN" ]; }; then
+        die "伪装站点不能填服务器自己的地址（反代会回环成 502）"
+      fi ;;
+  esac
+
+  rewrite_masq "$url"
+  M_MASQ="$url"
+  save_meta
+  if [ -n "$url" ]; then ok "伪装站点已更新：${url}"; else ok "已关闭伪装，直接访问端口返回 404"; fi
+
+  if svc_restart; then
+    sleep 2
+    if svc_active; then ok "服务已重启"; else warn "服务未起来，执行 $(svc_log_hint) 查看"; fi
+  fi
+  print_info
+}
+
 do_uninstall() {
   need_root
   detect_init
@@ -1187,6 +1295,7 @@ do_uninstall() {
 case "$ACTION" in
   install)   do_install ;;
   info)      need_root; detect_init; print_info ;;
+  masq)      do_masq ;;
   status)    detect_init; svc_status ;;
   log)       detect_init; svc_log_follow ;;
   restart)   need_root; detect_init; if svc_restart; then ok "已重启"; else die "重启失败"; fi ;;
