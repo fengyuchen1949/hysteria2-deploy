@@ -800,11 +800,18 @@ print_info() {
 
   uri="$(build_uri "$host" "$M_PORT" "$M_PASSWORD" "$M_OBFS" "$sni" "$insecure" "HY2-${host}")"
 
+  # 旧版脚本写入的 M_VER 是 unknown（取首行的 bug），这时现场问一次二进制，
+  # 免得用户为了看版本号去重装、把密码和证书一起换掉
+  local ver="${M_VER:-}"
+  if [ -z "$ver" ] || [ "$ver" = "unknown" ]; then
+    ver="$(get_version 2>/dev/null || true)"
+  fi
+
   echo
   hr
   printf ' %sHysteria2 节点信息%s\n' "$C_W" "$C_0"
   hr
-  kv "版本          " "${M_VER:-unknown}"
+  kv "版本          " "${ver:-unknown}"
   kv "地址          " "${host}"
   kv "端口          " "${M_PORT} (UDP)"
   kv "密码          " "${M_PASSWORD}"
