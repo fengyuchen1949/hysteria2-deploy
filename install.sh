@@ -6,7 +6,7 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.0.0
+#  脚本版本：1.0.1
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
@@ -30,11 +30,11 @@ set -Eeuo pipefail
 
 # Alpine 的 busybox ash 不支持 [[ ]] 与数组，必须用 bash 运行
 if [ -z "${BASH_VERSION:-}" ]; then
-  echo "[×] 本脚本需要 bash。Alpine 请先执行：apk add bash" >&2
+  echo "[x] 本脚本需要 bash。Alpine 请先执行：apk add bash" >&2
   exit 1
 fi
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -62,23 +62,41 @@ MASQ_MODE_SET=0           # 是否已由命令行指定，指定后不再询问
 BW_UP=""
 BW_DOWN=""
 PINNED_VERSION=""
+DL_VERSION=""               # 实际下载到的版本，二进制自报版本失败时兜底
 TUNE=1
 ASSUME_YES=0
 FORCE=0
 ACTION="install"
 
 # ------------------------------ 输出样式 ------------------------------
-if [ -t 1 ]; then
-  C_R="\033[31m"; C_G="\033[32m"; C_Y="\033[33m"; C_B="\033[36m"; C_W="\033[1m"; C_D="\033[2m"; C_0="\033[0m"
+# 颜色必须用 $'\e[..m' 定义成真实 ESC 字节。
+# 若写成双引号的 "\033[1m"，只有落在 printf 的 format 串里才会被解释，
+# 一旦作为 %s 的参数或经 echo 输出，终端就会看到字面的 \033[1m。
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_R=$'\e[31m'; C_G=$'\e[32m'; C_Y=$'\e[33m'; C_B=$'\e[36m'
+  C_W=$'\e[1m';  C_D=$'\e[2m';  C_0=$'\e[0m'
 else
   C_R=""; C_G=""; C_Y=""; C_B=""; C_W=""; C_D=""; C_0=""
 fi
-info() { printf "${C_B}[*]${C_0} %s\n" "$*"; }
-ok()   { printf "${C_G}[✓]${C_0} %s\n" "$*"; }
-warn() { printf "${C_Y}[!]${C_0} %s\n" "$*"; }
-die()  { printf "${C_R}[×]${C_0} %s\n" "$*" >&2; exit 1; }
-hr()   { printf "${C_D}%s${C_0}\n" "------------------------------------------------------------"; }
-step() { printf "\n${C_W}▸ %s${C_0}\n" "$*"; }
+
+# 统一用 %s 而非 %b：颜色已是真实 ESC，无需再解析转义，
+# 这样值里出现的反斜杠不会被当成转义序列吃掉。
+#
+# 标记一律用 ASCII 三字符 + 一个空格（共 4 列）。✓ × ▸ 这类符号属于
+# Unicode 宽度模糊区（East Asian Width = Ambiguous），在中文环境字体里
+# 常被渲染成 2 列，会让 [✓] 行比 [*] 行多缩进一格，整屏行首参差不齐。
+info() { printf '%s[*]%s %s\n' "$C_B" "$C_0" "$*"; }
+ok()   { printf '%s[+]%s %s\n' "$C_G" "$C_0" "$*"; }
+warn() { printf '%s[!]%s %s\n' "$C_Y" "$C_0" "$*"; }
+die()  { printf '%s[x]%s %s\n' "$C_R" "$C_0" "$*" >&2; exit 1; }
+hr()   { printf '%s%s%s\n' "$C_D" "------------------------------------------------------------" "$C_0"; }
+step() { printf '\n%s[>] %s%s\n' "$C_W" "$*" "$C_0"; }
+hint() { printf '    %s%s%s\n' "$C_D" "$*" "$C_0"; }
+
+# 键值两栏输出。标签预先按「中文占 2 列、ASCII 占 1 列」补齐到 14 列，
+# 不用 %-14s —— printf 按字节数补空格，"版本"是 6 字节、"SNI"是 3 字节，
+# 混排必然错位。
+kv() { printf ' %s%s\n' "$1" "$2"; }
 
 trap 'die "第 ${LINENO} 行执行失败，已中止"' ERR
 
@@ -118,25 +136,60 @@ pkg_install() {
       fi ;;
     *) warn "未识别的包管理器，请手动安装：${missing[*]}" ;;
   esac
+
+  local still=()
+  for p in "${missing[@]}"; do has "$p" || still+=("$p"); done
+  if [ ${#still[@]} -eq 0 ]; then
+    ok "依赖已就绪"
+  else
+    warn "未能安装：${still[*]}"
+  fi
+}
+
+# 二维码工具的安装命令按包管理器给，写死 apt 在 Alpine 上会误导
+qr_hint() {
+  case "$(pkg_mgr)" in
+    apk)    echo "apk add qrencode" ;;
+    apt)    echo "apt install -y qrencode" ;;
+    dnf)    echo "dnf install -y qrencode" ;;
+    yum)    echo "yum install -y qrencode" ;;
+    zypper) echo "zypper install -y qrencode" ;;
+    *)      echo "安装 qrencode" ;;
+  esac
+}
+
+# iptables 规则的持久化方式各发行版不同
+ipt_hint() {
+  case "$(pkg_mgr)" in
+    apk)    echo "apk add iptables-openrc && rc-update add iptables" ;;
+    apt)    echo "apt install -y iptables-persistent && netfilter-persistent save" ;;
+    dnf)    echo "dnf install -y iptables-services && systemctl enable iptables" ;;
+    yum)    echo "yum install -y iptables-services && systemctl enable iptables" ;;
+    zypper) echo "zypper install -y iptables && systemctl enable iptables" ;;
+    *)      echo "按发行版提供的机制保存规则" ;;
+  esac
 }
 
 # ------------------------------ 交互组件 ------------------------------
-ask() { # ask "提示" 变量名 默认值
-  local prompt="$1" var="$2" def="${3:-}" ans=""
+# 默认值只在方括号里出现一次。之前把「回车使用 X」写进提示语，
+# ask 又追加 [X]，同一串 IP 会在一行里显示两遍。
+ask() { # ask "提示" 变量名 [默认值] [secret]
+  local prompt="$1" var="$2" def="${3:-}" secret="${4:-}" ans="" tail=""
   if [ "$ASSUME_YES" -eq 1 ]; then printf -v "$var" '%s' "$def"; return 0; fi
-  if [ -n "$def" ]; then
-    read -r -p "$(printf "${C_B}?${C_0} %s [%s]: " "$prompt" "$def")" ans || true
-    ans="${ans:-$def}"
-  else
-    read -r -p "$(printf "${C_B}?${C_0} %s: " "$prompt")" ans || true
+  if [ -n "$def" ] && [ -z "$secret" ]; then
+    tail=" [${def}]"
+  elif [ -n "$def" ]; then
+    tail="（回车自动生成）"
   fi
+  read -r -p "${C_B}?${C_0} ${prompt}${tail}: " ans || true
+  [ -z "$ans" ] && ans="$def"
   printf -v "$var" '%s' "$ans"
 }
 
 confirm() { # confirm "提示" 默认值(y/n)
   local prompt="$1" def="${2:-y}" ans=""
   [ "$ASSUME_YES" -eq 1 ] && { [ "$def" = "y" ]; return; }
-  read -r -p "$(printf "${C_Y}?${C_0} %s [%s]: " "$prompt" "$def")" ans || true
+  read -r -p "${C_Y}?${C_0} ${prompt} [${def}]: " ans || true
   ans="${ans:-$def}"
   [[ "$ans" =~ ^[Yy] ]]
 }
@@ -147,10 +200,10 @@ choose() { # choose "提示" 变量名 选项1 选项2 ...
   local i ans
   [ "$ASSUME_YES" -eq 1 ] && { printf -v "$var" '%s' "1"; return 0; }
   for i in "${!opts[@]}"; do
-    printf "   ${C_B}%d${C_0}) %s\n" "$((i + 1))" "${opts[$i]}"
+    printf '   %s%d%s) %s\n' "$C_B" "$((i + 1))" "$C_0" "${opts[$i]}"
   done
   while :; do
-    read -r -p "$(printf "${C_B}?${C_0} %s [1]: " "$prompt")" ans || true
+    read -r -p "${C_B}?${C_0} ${prompt} [1]: " ans || true
     ans="${ans:-1}"
     if [[ "$ans" =~ ^[0-9]+$ ]] && [ "$ans" -ge 1 ] && [ "$ans" -le "${#opts[@]}" ]; then
       printf -v "$var" '%s' "$ans"; return 0
@@ -403,10 +456,16 @@ pick_masq_random() {
 
 
 # ------------------------------ 安装二进制 ------------------------------
+# `hysteria version` 打印的是 appAboutLong：appLogo 常量以换行开头，
+# 所以第一行是空行，版本号实际在第九行（Version:\tapp/v2.13.0）。
+# 原来用 sed -n '1p' 取首行，永远拿到空串，于是显示成 unknown。
+# 这里从整段输出里用正则抠版本号，顺带兼容 stderr 输出的构建。
 get_version() {
-  local v
-  v="$("$HY2_BIN" version 2>/dev/null | sed -n '1p' | tr -d '\r' || true)"
-  printf '%s' "${v:-unknown}"
+  local v=""
+  v="$("$HY2_BIN" version 2>&1 | tr -d '\r' \
+        | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+[0-9A-Za-z.+-]*' | head -n1 || true)"
+  [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+  printf '%s' "${DL_VERSION:-${PINNED_VERSION:-unknown}}"
 }
 
 install_binary() {
@@ -456,7 +515,7 @@ gen_selfsigned() {
 
   CERT_PIN="$(openssl x509 -in "${HY2_DIR}/cert.pem" -noout -fingerprint -sha256 \
               | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')"
-  ok "证书已生成，pinSHA256 = ${CERT_PIN}"
+  ok "证书已生成（有效期 10 年），pinSHA256: ${CERT_PIN}"
 }
 
 # ------------------------------ 配置 / 服务 ------------------------------
@@ -650,7 +709,7 @@ EOF
     { echo; echo "# --- hysteria2-deploy ---"; grep -E '^[[:space:]]*net\.' "$SYSCTL_FILE" 2>/dev/null; } >> /etc/sysctl.conf 2>/dev/null || true
   fi
 
-  ok "内核调优已应用（fq + BBR + UDP 缓冲 16MB）"
+  ok "内核调优已生效（fq + BBR + UDP 缓冲 16MB）"
 }
 
 open_firewall() {
@@ -674,7 +733,8 @@ open_firewall() {
         iptables -I INPUT -p "${p#*/}" --dport "${p%/*}" -j ACCEPT 2>/dev/null || true
       fi
     done
-    ok "iptables 已放行：${ports[*]}（重启后不保留，如需持久化请装 iptables-persistent）"
+    ok "iptables 已放行：${ports[*]}"
+    hint "规则重启后不保留，持久化方式：$(ipt_hint)"
   fi
 
   local extra=""
@@ -742,35 +802,36 @@ print_info() {
 
   echo
   hr
-  printf " ${C_G}${C_W}Hysteria2 节点信息${C_0}\n"
+  printf ' %sHysteria2 节点信息%s\n' "$C_W" "$C_0"
   hr
-  printf " %-12s %s\n" "版本"     "${M_VER:-unknown}"
-  printf " %-12s %s\n" "地址"     "${host}"
-  printf " %-12s %s\n" "端口"     "${M_PORT} (UDP)"
-  printf " %-12s %s\n" "密码"     "${M_PASSWORD}"
-  printf " %-12s %s\n" "SNI"      "${sni}"
+  kv "版本          " "${M_VER:-unknown}"
+  kv "地址          " "${host}"
+  kv "端口          " "${M_PORT} (UDP)"
+  kv "密码          " "${M_PASSWORD}"
+  kv "SNI           " "${sni}"
   if [ "$insecure" = "1" ]; then
-    printf " %-12s %s\n" "跳过验证" "是（自签证书）"
+    kv "跳过验证      " "是（自签证书）"
   else
-    printf " %-12s %s\n" "跳过验证" "否（正式证书）"
+    kv "跳过验证      " "否（正式证书）"
   fi
-  [ -n "${M_OBFS:-}" ] && printf " %-12s %s\n" "混淆" "salamander / ${M_OBFS}"
-  [ -n "$pin" ] && printf " %-12s %s\n" "pinSHA256" "${pin}"
-  [ -n "${M_MASQ:-}" ] && printf " %-12s %s\n" "伪装站点" "${M_MASQ}"
+  [ -n "${M_OBFS:-}" ] && kv "混淆          " "salamander / ${M_OBFS}"
+  [ -n "$pin" ] && kv "pinSHA256     " "${pin}"
+  [ -n "${M_MASQ:-}" ] && kv "伪装站点      " "${M_MASQ}"
   hr
   echo
-  printf "${C_B}分享链接${C_0}\n"
+  printf '%s分享链接%s\n' "$C_B" "$C_0"
   printf '%s\n' "$uri"
   echo
 
   if has qrencode; then
     qrencode -t ANSIUTF8 -m 1 "$uri" 2>/dev/null || true
   else
-    info "需要二维码：apt install -y qrencode"
+    info "未安装 qrencode，需要二维码请执行：$(qr_hint)"
   fi
 
+  echo
   hr
-  printf "${C_B}Clash Meta / mihomo${C_0}\n"
+  printf '%sClash Meta / mihomo%s\n' "$C_B" "$C_0"
   printf 'proxies:\n'
   printf '  - name: "HY2-%s"\n' "$host"
   printf '    type: hysteria2\n'
@@ -791,7 +852,7 @@ print_info() {
   printf '    up: "50 Mbps"\n'
   printf '    down: "200 Mbps"\n'
   echo
-  printf "${C_B}sing-box（outbound）${C_0}\n"
+  printf '%ssing-box（outbound）%s\n' "$C_B" "$C_0"
   printf '{\n'
   printf '  "type": "hysteria2",\n'
   printf '  "tag": "hy2",\n'
@@ -807,15 +868,20 @@ print_info() {
   printf '  "down_mbps": 200\n'
   printf '}\n'
   hr
+  kv "配置文件      " "${HY2_CONF}"
+  kv "服务状态      " "$(svc_status_hint)"
   echo
-  info "配置文件：${HY2_CONF}    服务：$(svc_status_hint)"
 }
 
 # ------------------------------ 安装向导 ------------------------------
 collect_config() {
   local pubip=""
   pubip="$(detect_pubip)"
-  [ -n "$pubip" ] && info "检测到公网 IP：${C_W}${pubip}${C_0}" || warn "未能自动获取公网 IP，请手动输入"
+  if [ -n "$pubip" ]; then
+    info "检测到公网 IP：${C_W}${pubip}${C_0}"
+  else
+    warn "未能自动获取公网 IP，请手动输入"
+  fi
 
   # --- 1. 连接地址 ---
   step "1/6  客户端连接地址"
@@ -824,7 +890,7 @@ collect_config() {
     HOST="$DOMAIN"
   fi
   if [ -z "$HOST" ]; then
-    ask "域名或 IP（回车使用 ${pubip:-检测值}）" HOST "$pubip"
+    ask "域名或 IP" HOST "$pubip"
   else
     ask "域名或 IP" HOST "$HOST"
   fi
@@ -832,7 +898,7 @@ collect_config() {
 
   # --- 2. 端口 ---
   step "2/6  监听端口"
-  echo "   ${C_D}Hysteria2 走 UDP。部分机房对 443 有 QoS，可改 8443 / 2096 等${C_0}"
+  hint "Hysteria2 走 UDP。部分机房对 443 有 QoS，可改 8443 / 2096 等"
   ask "UDP 端口" PORT "$PORT"
   [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1 ] && [ "$PORT" -le 65535 ] || die "端口非法：$PORT"
 
@@ -878,22 +944,22 @@ collect_config() {
   # --- 4. 认证密码 ---
   step "4/6  认证密码"
   [ -z "$PASSWORD" ] && PASSWORD="$(rand_hex 16)"
-  ask "密码（回车使用随机值）" PASSWORD "$PASSWORD"
+  ask "认证密码" PASSWORD "$PASSWORD" secret
 
   # --- 5. 混淆 ---
   step "5/6  流量混淆"
-  echo "   ${C_D}salamander 会给 QUIC 包加一层异或混淆，抗主动探测，建议开启${C_0}"
+  hint "salamander 给 QUIC 包加一层异或混淆，抗主动探测，建议开启"
   if confirm "启用 salamander 混淆？" "y"; then
     USE_OBFS=1
     [ -z "$OBFS_PASSWORD" ] && OBFS_PASSWORD="$(rand_hex 16)"
-    ask "混淆密码（回车使用随机值）" OBFS_PASSWORD "$OBFS_PASSWORD"
+    ask "混淆密码" OBFS_PASSWORD "$OBFS_PASSWORD" secret
   else
     USE_OBFS=0
   fi
 
   # --- 6. 伪装 / 调优 ---
   step "6/6  伪装与调优"
-  echo "   ${C_D}伪装站点决定别人扫到你端口时看到什么页面${C_0}"
+  hint "伪装站点决定别人扫到你端口时看到什么页面"
 
   if [ "$MASQ_MODE_SET" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
     choose "伪装站点" MASQ_CHOICE \
@@ -946,15 +1012,15 @@ collect_config() {
 show_summary() {
   echo
   hr
-  printf " ${C_W}即将执行${C_0}\n"
+  printf ' %s即将执行%s\n' "$C_W" "$C_0"
   hr
-  printf " %-12s %s\n" "连接地址" "${HOST}"
-  printf " %-12s %s\n" "端口"     "${PORT}/udp"
-  printf " %-12s %s\n" "证书"     "$([ "$MODE" = "acme" ] && echo "ACME 自动签发（${DOMAIN}）" || echo "自签（pinSHA256）")"
-  printf " %-12s %s\n" "密码"     "${PASSWORD}"
-  printf " %-12s %s\n" "混淆"     "$([ "$USE_OBFS" -eq 1 ] && echo "salamander / ${OBFS_PASSWORD}" || echo "关闭")"
-  printf " %-12s %s\n" "伪装站点" "$([ "$MASQ_MODE" = "none" ] && echo "关闭（返回 404）" || echo "${MASQ_URL}")"
-  printf " %-12s %s\n" "内核调优" "$([ "$TUNE" -eq 1 ] && echo "是" || echo "否")"
+  kv "连接地址      " "${HOST}"
+  kv "端口          " "${PORT}/udp"
+  kv "证书          " "$([ "$MODE" = "acme" ] && echo "ACME 自动签发（${DOMAIN}）" || echo "自签（pinSHA256）")"
+  kv "密码          " "${PASSWORD}"
+  kv "混淆          " "$([ "$USE_OBFS" -eq 1 ] && echo "salamander / ${OBFS_PASSWORD}" || echo "关闭")"
+  kv "伪装站点      " "$([ "$MASQ_MODE" = "none" ] && echo "关闭（返回 404）" || echo "${MASQ_URL}")"
+  kv "内核调优      " "$([ "$TUNE" -eq 1 ] && echo "是" || echo "否")"
   hr
   echo
 }
@@ -969,7 +1035,7 @@ do_install() {
 
   echo
   hr
-  printf " ${C_W}Hysteria2 一键部署${C_0}   ${C_D}v${SCRIPT_VERSION}${C_0}\n"
+  printf ' %sHysteria2 一键部署%s   %sv%s%s\n' "$C_W" "$C_0" "$C_D" "$SCRIPT_VERSION" "$C_0"
   hr
 
   if [ -f "$HY2_CONF" ] && [ "$FORCE" -eq 0 ]; then
@@ -992,7 +1058,9 @@ do_install() {
   # 向导
   collect_config
   show_summary
-  [ "$ASSUME_YES" -eq 0 ] && { confirm "确认开始安装？" "y" || { info "已取消"; exit 0; }; }
+  if [ "$ASSUME_YES" -eq 0 ]; then
+    confirm "确认开始安装？" "y" || { info "已取消"; exit 0; }
+  fi
 
   # 安装
   mkdir -p "$HY2_DIR"
@@ -1007,7 +1075,7 @@ do_install() {
 
   write_config
   write_service
-  [ "$TUNE" -eq 1 ] && tune_sysctl || info "跳过内核调优"
+  if [ "$TUNE" -eq 1 ]; then tune_sysctl; else info "跳过内核调优"; fi
 
   step "启动服务"
   svc_enable
