@@ -20,7 +20,7 @@
 ## 一键安装
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/hysteria2-deploy/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/fengyuchen1949/hysteria2-deploy/main/install.sh)
 ```
 
 > 用 `bash <(curl ...)` 而不是 `curl | bash`：脚本需要从终端读取交互输入，进程替换方式最稳妥。
@@ -32,22 +32,23 @@ bash <(curl -fsSL https://raw.githubusercontent.com/<你的用户名>/hysteria2-
 curl -fsSL https://example.com/hy2.sh -o hy2.sh && bash hy2.sh
 ```
 
-## 部署到你自己的 GitHub
+## 先审脚本再跑
 
-仓库文件已经备齐，推上去就能用 raw 地址在线跑：
+不想直接 `curl | bash` 的话，把脚本拉下来看一眼：
 
 ```bash
-cd hysteria2-deploy
-git init -b main
-git add .
-git commit -m "feat: hysteria2 一键部署脚本"
-git remote add origin git@github.com:<你的用户名>/hysteria2-deploy.git
-git push -u origin main
+curl -fsSL https://raw.githubusercontent.com/fengyuchen1949/hysteria2-deploy/main/install.sh -o hy2.sh
+less hy2.sh      # 确认没问题
+bash hy2.sh
 ```
 
-推完把本文件里的 `<你的用户名>` 替换成你的 GitHub 用户名，`LICENSE` 里的 `<YOUR NAME>` 也顺手改掉。
+克隆整个仓库：
 
-> 仓库必须设为 **public**：私有仓库的 `raw.githubusercontent.com` 地址需要 token，`curl` 直接拉会 404。
+```bash
+git clone https://github.com/fengyuchen1949/hysteria2-deploy.git
+```
+
+> 仓库是 **public**，raw 地址无需 token。若 fork 后改成私有仓库，raw 地址需要带 token，`curl` 会 404。
 
 ## 安装过程长什么样
 
