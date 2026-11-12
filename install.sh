@@ -6,7 +6,7 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.0.2
+#  脚本版本：1.0.3
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
@@ -34,7 +34,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -984,7 +984,7 @@ collect_config() {
 
   # --- 6. 伪装 / 调优 ---
   step "6/6  伪装与调优"
-  hint "伪装站点决定别人扫到你端口时看到什么页面"
+  hint "伪装站点决定别人扫到你端口时看到什么页面，与上面的连接地址无关"
 
   if [ "$MASQ_MODE_SET" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
     choose "伪装站点" MASQ_CHOICE \
@@ -1007,7 +1007,14 @@ collect_config() {
       case "$MASQ_URL" in
         http://*|https://*) ;;
         *) die "伪装 URL 需以 http:// 或 https:// 开头" ;;
-      esac ;;
+      esac
+      # 指向本机 = 反向代理的请求又回到自己，稳定 502，比不配伪装还假
+      local mhost="${MASQ_URL#*://}"
+      mhost="${mhost%%/*}"
+      mhost="${mhost%:${PORT}}"
+      if [ "$mhost" = "$HOST" ] || { [ -n "$pubip" ] && [ "$mhost" = "$pubip" ]; }; then
+        die "伪装站点不能填服务器自己的地址（反代会回环成 502），换成正常网站；不在乎伪装就选 4"
+      fi ;;
     auto)
       info "探测候选站点可用性（并行，最多约 6 秒）"
       picked="$(pick_masq_auto)"
