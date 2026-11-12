@@ -1,0 +1,123 @@
+name: upstream
+
+# 目的：脚本不锁 Hysteria 版本（每次装/升级都拉 latest），所以上游发新版本身
+# 不需要改仓库。真正的风险是上游改了 config.yaml 的字段名或结构 —— 那种情况下
+# 脚本生成的配置会被新二进制拒绝，用户装完才发现服务起不来。
+#
+# 这里每天用「脚本自己生成的配置」去喂「上游最新的二进制」：能被解析说明字段
+# 仍然有效，解析失败就开 issue 报警。
+
+on:
+  push:
+    paths:
+      - install.sh
+      - .github/workflows/upstream.yml
+  schedule:
+    - cron: '17 3 * * *'      # 每天 03:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: upstream
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 查询上游最新版本
+        id: up
+        run: |
+          tag="$(curl -fsSL --retry 3 https://api.github.com/repos/apernet/hysteria/releases/latest \
+                 | python3 -c 'import json,sys; print(json.load(sys.stdin)["tag_name"])')"
+          ver="${tag#app/}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "ver=${ver}" >> "$GITHUB_OUTPUT"
+          echo "上游最新：${ver}（tag ${tag}，仓库已验：$(cat UPSTREAM_VERSION 2>/dev/null || echo 未记录)）"
+
+      - name: 用脚本生成配置
+        run: |
+          sudo bash install.sh --yes --ip --port 8443 \
+            --masquerade https://www.bing.com/ \
+            --bw-up '100 mbps' --bw-down '100 mbps' \
+            --dry-run
+          echo "--- 生成的配置 ---"
+          sudo cat /etc/hysteria/config.yaml
+
+      - name: 交给上游二进制解析
+        id: parse
+        run: |
+          # 配置合法时进程会一直跑（被 timeout 杀掉，退出码 124）；
+          # 字段被改名/删除时会在解析阶段立刻退出并打印原因。
+          rc=0
+          sudo timeout 6 /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml \
+            > /tmp/hy.log 2>&1 || rc=$?
+          echo "--- 二进制输出 ---"
+          cat /tmp/hy.log
+          if [ "$rc" -eq 124 ]; then
+            echo "ok=1" >> "$GITHUB_OUTPUT"
+            echo "结论：配置被接受"
+          else
+            echo "ok=0" >> "$GITHUB_OUTPUT"
+            echo "结论：配置被拒绝，退出码 ${rc}"
+          fi
+
+      - name: 记录已验证版本
+        if: steps.parse.outputs.ok == '1'
+        run: |
+          ver='${{ steps.up.outputs.ver }}'
+          old="$(cat UPSTREAM_VERSION 2>/dev/null || echo '')"
+          if [ "$ver" = "$old" ]; then
+            echo "版本未变化（${ver}），无需提交"
+            exit 0
+          fi
+          echo "$ver" > UPSTREAM_VERSION
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add UPSTREAM_VERSION
+          git commit -m "chore: 上游 ${ver} 的配置字段校验通过"
+          git push || echo "推送失败（可能需要手动同步），版本文件已在本地更新"
+
+      - name: 校验失败时报警
+        if: steps.parse.outputs.ok == '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ver='${{ steps.up.outputs.ver }}'
+          title="上游 ${ver} 拒绝脚本生成的配置"
+          {
+            echo "每天的上游巡检发现：\`install.sh\` 在 dry-run 下生成的 \`config.yaml\`，"
+            echo "被 Hysteria **${ver}** 的二进制在解析阶段拒绝。"
+            echo
+            echo "这通常意味着上游改了配置字段（改名、删除、结构变化），"
+            echo "需要对照 [服务端配置文档](https://v2.hysteria.network/zh/docs/Advanced/Full-Server-Config/) 修正 \`write_config()\`。"
+            echo
+            echo "### 上游输出"
+            echo
+            echo '```'
+            tail -n 40 /tmp/hy.log
+            echo '```'
+            echo
+            echo "### 复现"
+            echo
+            echo '```bash'
+            echo "sudo bash install.sh --yes --ip --port 8443 --masquerade https://www.bing.com/ --dry-run"
+            echo "sudo timeout 6 hysteria server -c /etc/hysteria/config.yaml"
+            echo '```'
+            echo
+            echo "> 由 \`.github/workflows/upstream.yml\` 自动生成。修好后本任务转绿，下次巡检会自己更新 \`UPSTREAM_VERSION\`。"
+          } > /tmp/issue.md
+
+          num="$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number // empty')"
+          if [ -n "$num" ]; then
+            gh issue comment "$num" --body-file /tmp/issue.md
+            echo "已在 issue #${num} 追加评论"
+          else
+            gh issue create --title "$title" --body-file /tmp/issue.md
+          fi
+          exit 1

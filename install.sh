@@ -6,7 +6,7 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.1.0
+#  脚本版本：1.2.0
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
@@ -41,7 +41,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -90,6 +90,8 @@ DL_VERSION=""               # 实际下载到的版本，二进制自报版本�
 TUNE=1
 ASSUME_YES=0
 FORCE=0
+DRY_RUN=0                   # 只生成配置就退出，供 CI 用上游二进制校验
+TUNE_SET=0                  # 命令行已显式指定调优开关，向导不再覆盖
 ACTION="install"
 SUB=()                      # relay 后面的子命令与位置参数
 RELAY_LINK=""
@@ -300,6 +302,7 @@ Hysteria2 一键部署脚本（systemd / OpenRC）
   --no-tune              不写入内核调优
   --version <vX.Y.Z>     指定 Hysteria 版本，默认最新
   --yes, -y              零交互
+  --dry-run              只生成配置就退出（CI 校验上游配置字段兼容性用）
   --force                已安装时直接覆盖
   -h, --help             帮助
 
@@ -335,10 +338,11 @@ while [ $# -gt 0 ]; do
       set_masq "$2"; shift 2 ;;
     --bw-up)         BW_UP="${2:-}"; shift 2 ;;
     --bw-down)       BW_DOWN="${2:-}"; shift 2 ;;
-    --no-tune)       TUNE=0; shift ;;
+    --no-tune)       TUNE=0; TUNE_SET=1; shift ;;
     --version)       PINNED_VERSION="${2:-}"; shift 2 ;;
     --yes|-y)        ASSUME_YES=1; shift ;;
     --force)         FORCE=1; shift ;;
+    --dry-run)       DRY_RUN=1; ASSUME_YES=1; FORCE=1; TUNE=0; TUNE_SET=1; shift ;;
     -h|--help)       usage; exit 0 ;;
     -*) die "未知参数：$1（--help 查看帮助）" ;;
     *)  # masq 后面可以直接跟值：masq auto / masq none / masq https://...
@@ -1153,7 +1157,11 @@ collect_config() {
       info "已关闭伪装，直接访问端口会返回 404" ;;
   esac
 
-  confirm "写入内核调优（fq + BBR + UDP 缓冲）？" "y" && TUNE=1 || TUNE=0
+  if [ "$TUNE_SET" -eq 0 ]; then
+    confirm "写入内核调优（fq + BBR + UDP 缓冲）？" "y" && TUNE=1 || TUNE=0
+  else
+    info "内核调优：$([ "$TUNE" -eq 1 ] && echo 已启用 || echo 已跳过)（命令行指定）"
+  fi
 
   # --- 校验 ---
   case "$PASSWORD" in *'"'*|*'\'*|*' '*|'') die "认证密码不能为空，且不能含双引号/反斜杠/空格" ;; esac
@@ -1204,7 +1212,9 @@ do_install() {
   fi
 
   # 依赖
-  pkg_install curl openssl ca-certificates iproute2
+  if [ "$DRY_RUN" -eq 0 ]; then
+    pkg_install curl openssl ca-certificates iproute2
+  fi
   has curl    || die "缺少 curl"
   has openssl || die "缺少 openssl"
 
@@ -1227,6 +1237,12 @@ do_install() {
   fi
 
   write_config
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    ok "dry-run：配置已生成 ${HY2_CONF}（未写服务、未启动、未改内核）"
+    return 0
+  fi
+
   write_service
   if [ "$TUNE" -eq 1 ]; then tune_sysctl; else info "跳过内核调优"; fi
 

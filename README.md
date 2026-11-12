@@ -163,6 +163,7 @@ bash install.sh --version v2.13.0 --yes
 | `--version <vX.Y.Z>` | 指定 Hysteria 版本 |
 | `--yes` / `-y` | 零交互 |
 | `--force` | 已安装时直接覆盖 |
+| `--dry-run` | 只生成配置就退出，不写服务、不启动、不改内核（CI 校验用） |
 
 ## 两种证书模式
 
@@ -403,6 +404,23 @@ hy2 relay diag             # 排障：看每条规则命中了多少包
 
 **只做 DNAT 不行**：落地机看到的源地址会是真实客户端 IP，回包绕过中转机直接发给客户端；而客户端 socket 连的是中转机，源地址对不上就被内核丢掉，表现是「握手成功，一发数据就卡死」。加上 MASQUERADE 后回程才会走回中转机。
 
+### 一个包到底经历了什么
+
+客户端连的是 `VPS2:20001`，配置里却写着落地机的密码和证书指纹——中转机在这一层是完全透明的。一个上行包走完这四步：
+
+| 步骤 | 在哪 | 发生了什么 |
+|---|---|---|
+| ① 进 | VPS2 `nat PREROUTING` | 命中 `HY2R_PRE`：`-p udp --dport 20001 -j DNAT --to-destination VPS1:58443`，目的地址被改写 |
+| ② 出 | VPS2 `nat POSTROUTING` | 命中 `HY2R_POST`：`-d VPS1 -j MASQUERADE`，源地址改写成 VPS2 自己的 IP |
+| ③ 回 | VPS1 | Hysteria 收到一个看起来来自 VPS2 的普通 QUIC 包，正常解密、正常回包给 VPS2 |
+| ④ 还原 | VPS2 `nat` 回程 | conntrack 记着这条会话，自动把源地址还原成 `VPS1:58443`，客户端看到的是「VPS2 在跟我说话」 |
+
+**② 这一步是关键**。只做 ① 的话，VPS1 收到的源地址还是真实客户端 IP，它会直接把回包发给客户端；可客户端的 UDP socket 连的是 VPS2，内核一看源地址不是 VPS2 就丢弃，握手能成（因为握手包小、可能碰巧），一开始传数据就卡死。MASQUERADE 让 VPS1 只能把回包交给 VPS2，回程才闭环。
+
+**为什么必须 `net.ipv4.ip_forward=1`**：包要在 VPS2 上「进一个网卡、出另一个网卡」，不开转发内核直接丢。脚本会写 `/etc/sysctl.d/99-hy2-relay.conf` 并立即 `sysctl -p`，不用自己记。
+
+**为什么规则写在自定义链**：直接往 `PREROUTING` 里 `-A` 也能用，但删规则时容易误删别人的，重装/卸载也清不干净。`HY2R_PRE` / `HY2R_POST` 是自己的链，`-F` 一次清空，卸载时 `-X` 删链，系统原有规则一个字节不动。
+
 ### 四个要注意的地方
 
 | 事项 | 说明 |
@@ -417,6 +435,52 @@ hy2 relay diag             # 排障：看每条规则命中了多少包
 - 包数是 0 → 客户端连的地址/端口不对，或 VPS2 安全组没放行
 - 包数在涨但连不上 → VPS1 没放行 UDP，或 VPS1 上服务没起（`hy status` 看）
 - 两边都正常还是断 → 多半是客户端缓存了旧链接，删掉节点重新导入
+
+## 跟随上游版本
+
+脚本**不锁版本**：`install` 和 `upgrade` 每次都从 GitHub Releases 取 `latest`。上游发新版，你只要在 VPS 上 `hy` → `7` → 升级，仓库不用动。
+
+真正会出问题的不是版本号，是**配置字段**。假设某天上游把 `masquerade.proxy.url` 改名成 `masquerade.proxy.target`，脚本还是会下载到新二进制、还是会把旧字段写进 `config.yaml`，然后服务起不来——等你装完才发现。
+
+所以仓库带了一个每天跑的巡检（`.github/workflows/upstream.yml`）：
+
+```
+每天 03:17 UTC（也可手动触发）
+  ├─ 查上游最新 release tag
+  ├─ sudo bash install.sh --dry-run --yes ...
+  │     用脚本自己生成 /etc/hysteria/config.yaml（不是仓库里另存一份）
+  ├─ sudo timeout 6 hysteria server -c /etc/hysteria/config.yaml
+  │     配置合法 → 进程一直跑 → 被 timeout 杀 → 退出码 124
+  │     字段失效 → 解析阶段就退出 → 退出码 1 + 错误原因
+  ├─ 通过且版本变了 → 自动提交 UPSTREAM_VERSION
+  └─ 失败 → 自动开 issue，把上游的报错原文贴进去
+```
+
+三个要点：
+
+- **校验的是脚本本身**，不是复制品。CI 跑的就是你 `curl | bash` 的那份文件，改了 `write_config()` 立刻会被验到
+- **`--dry-run` 只生成配置**，不写 systemd、不启动、不改内核，在 CI 容器里能安全跑
+- **`UPSTREAM_VERSION` 记录的是「已被上游二进制接受过的版本」**，不是脚本里写死的版本号。仓库首页看到它，说明那个版本的字段组合是验过的
+
+收到 issue 之后怎么修：
+
+```bash
+# 1. 本地复现，看新二进制到底拒绝哪个字段
+sudo bash install.sh --yes --ip --port 8443 --dry-run
+sudo timeout 6 hysteria server -c /etc/hysteria/config.yaml
+
+# 2. 对照官方 Full Server Config 改 write_config()
+#    https://v2.hysteria.network/zh/docs/Advanced/Full-Server-Config/
+
+# 3. 跑一次 dry-run + 二进制，通过后 push，CI 会自己把 UPSTREAM_VERSION 推到新版本
+```
+
+想临时躲开某个新版，装的时候加 `--version` 锁住：
+
+```bash
+bash install.sh --version v2.13.0 --yes        # 装
+bash install.sh --version v2.13.0 --yes --force # 已装则重装到该版本
+```
 
 ## 文件清单
 
@@ -438,6 +502,14 @@ hy2 relay diag             # 排障：看每条规则命中了多少包
 | `/etc/sysctl.d/99-hy2-relay.conf` | 转发开关 + conntrack 超时（有转发时） |
 
 卸载会清掉以上全部内容（`uninstall` 不管中转规则，用 `hy relay clear` 单独清）。二进制从 GitHub Releases 下载，失败自动切官方加速域名 `download.hysteria.network`。
+
+仓库里还有三个跟上游联动有关的文件：
+
+| 文件 | 作用 |
+|---|---|
+| `UPSTREAM_VERSION` | 已被上游二进制验证通过的版本号，由 CI 自动维护，不用手改 |
+| `.github/workflows/upstream.yml` | 每日巡检：`--dry-run` 生成配置 → 上游二进制解析 → 不通过就开 issue |
+| `.github/workflows/lint.yml` | 每次 push 跑 `bash -n` + ShellCheck |
 
 ## 常见问题
 
