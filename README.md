@@ -9,6 +9,7 @@
 ## 特性
 
 - **完整交互向导**：地址 → 端口 → 证书方式 → 密码 → 混淆 → 伪装/调优，六步问完自动装
+- **伪装站点自动探测**：内置 7 个候选站并行测速选最快，也可随机 / 关闭 / 手填
 - **自动装依赖**：apt / dnf / yum / zypper 全部适配，缺什么装什么
 - **两种证书模式**：域名 ACME 自动签发，或自签 + pinSHA256（无需域名）
 - **开机自启**：systemd 服务，`Restart=on-failure`，`LimitNOFILE=1048576`
@@ -74,7 +75,14 @@ git clone https://github.com/fengyuchen1949/hysteria2-deploy.git
 ? 启用 salamander 混淆？ [y]:
 
 ▸ 6/6  伪装与调优
-? 伪装站点 URL [https://www.bing.com/]:
+   伪装站点决定别人扫到你端口时看到什么页面
+   1) 自动探测（并行测候选站，选最快的）
+   2) 随机选一个（不探测，装得更快）
+   3) 手动指定 URL
+   4) 关闭（直接访问端口返回 404）
+? 伪装站点 [1]: 1
+[*] 探测候选站点可用性（并行，最多约 6 秒）
+[✓] 自动选定：https://www.baidu.com/
 ? 写入内核调优（fq + BBR + UDP 缓冲）？ [y]:
 
 ------------------------------------------------------------
@@ -120,7 +128,7 @@ bash install.sh --version v2.13.0 --yes
 | `--password <密码>` | 认证密码，默认随机 32 位 hex |
 | `--obfs-password <密码>` | 混淆密码，默认随机 |
 | `--no-obfs` | 关闭 salamander 混淆 |
-| `--masquerade <URL>` | 伪装站点，默认 `https://www.bing.com/` |
+| `--masquerade <值>` | 伪装站点：`auto` 自动探测（默认）/ `random` 随机 / `none` 关闭 / `<URL>` 手动指定 |
 | `--bw-up` / `--bw-down` | 服务端带宽，如 `"100 mbps"` |
 | `--no-tune` | 不写内核调优 |
 | `--version <vX.Y.Z>` | 指定 Hysteria 版本 |
@@ -138,6 +146,57 @@ bash install.sh --version v2.13.0 --yes
 | 前置条件 | 无 | TCP 80/443 空闲 |
 
 自签模式脚本会打印 **pinSHA256**（证书的 SHA256 指纹，hex）。客户端填它比无脑 `insecure: true` 安全，能防中间人。
+
+## 伪装站点
+
+伪装站点（`masquerade`）决定**别人直接访问你端口时看到什么**。配了它，探测者用浏览器打开 `https://你的域名:443` 会看到正常的网页；不配则返回 404，一眼就能看出这是个代理端口。
+
+脚本提供四种策略，向导第 6 步可选：
+
+| 策略 | 行为 | 耗时 |
+|---|---|---|
+| `auto`（默认） | 并行探测候选池，选反代耗时最短的 | 约 2-6 秒 |
+| `random` | 不探测，从候选池随机抽一个 | 0 |
+| `none` | 不写 `masquerade` 段，直接返回 404 | 0 |
+| `<URL>` | 用你指定的地址 | 0 |
+
+```bash
+bash install.sh --masquerade auto    # 自动探测
+bash install.sh --masquerade random  # 随机
+bash install.sh --masquerade none    # 关闭
+bash install.sh --masquerade https://www.example.com/   # 手动
+```
+
+### 探测具体做了什么
+
+对候选池里的每个站点发一次带浏览器 UA 的 HTTPS 请求，只保留满足以下条件的：
+
+- 跟随重定向后状态码是 2xx/3xx
+- 响应体 ≥ 800 字节（过滤纯跳转页、空白页、Cloudflare 挑战页）
+- 6 秒内返回
+
+然后按 `time_total` 排序取最快的一个。7 个站点并行探测，总耗时取决于最慢的那个，不会累加。
+
+候选池：`bing.com`、`apple.com`、`microsoft.com`、`cloudflare.com`、`baidu.com`、`qq.com`、`163.com`——都是全球有 CDN、无反爬挑战、首页体积可控、内容中性的站点。
+
+### 一个必须说清楚的局限
+
+**探测的是「你的 VPS 能不能访问目标站点」，不是「你的客户端能不能」。**
+
+服务端只负责回源：VPS 拉不到目标站，反代就会 502，伪装直接穿帮——这是探测能保证的。但客户端在什么网络环境、那个站点在客户端那边通不通，VPS 无从得知。
+
+所以：
+
+- 主要面向国内用户 → 选 `baidu.com` / `qq.com`（探测时它们如果最快，说明回源线路也好）
+- 主要面向海外用户 → 选 `bing.com` / `apple.com`
+- 想手动控制但懒得选 → `random` 也行，候选池里的站都在全球有 CDN，误判概率不高
+- 不确定 → 用 `auto`，至少保证回源不出错
+
+### 另外两个技术点
+
+**`rewriteHost: true` 是必须的。** Hysteria 反代时默认转发客户端原始 `Host` 头，也就是 `你的域名:443` 或 IP。目标站点不认识这个 Host，会返回 400/404——伪装反而更可疑。脚本已经写死 `true`。
+
+**伪装不是加密。** 它只是让端口看起来像正常网站，不改变协议特征。真要抗审查，靠的是 ACME 真证书 + salamander 混淆 + 伪装三者叠加。
 
 ## 客户端配置
 
@@ -232,6 +291,16 @@ UDP 端口被占用：`ss -lunp | grep 443`，换端口重装。
 
 **想换端口/密码**
 直接重跑 `bash install.sh --force`，向导里改完即可。
+
+**伪装站点自动探测全部失败**
+说明 VPS 出网被限制（少见，通常是内网机器或 DNS 坏了）。脚本会自动回落到 `https://www.bing.com/`。想彻底避免回源请求，用 `--masquerade none`。
+
+**伪装站点打开后是 404 / 空白页**
+```bash
+curl -I https://你的伪装站点/     # 在 VPS 上测回源是否正常
+journalctl -u hysteria-server -n 30 | grep -i masquerade
+```
+多半是目标站点变更了反爬策略，换一个：`bash install.sh --force --masquerade random`。
 
 ## 免责声明
 

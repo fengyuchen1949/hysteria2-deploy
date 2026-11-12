@@ -45,6 +45,8 @@ PASSWORD=""
 OBFS_PASSWORD=""
 USE_OBFS=1
 MASQ_URL="https://www.bing.com/"
+MASQ_MODE="auto"          # auto=自动探测 / random=随机 / manual=手填 / none=关闭
+MASQ_MODE_SET=0           # 是否已由命令行指定，指定后不再询问
 BW_UP=""
 BW_DOWN=""
 PINNED_VERSION=""
@@ -139,6 +141,16 @@ choose() { # choose "提示" 变量名 选项1 选项2 ...
 }
 
 # ------------------------------ 参数解析 ------------------------------
+set_masq() { # 解析 --masquerade 的取值
+  MASQ_MODE_SET=1
+  case "${1:-}" in
+    auto)            MASQ_MODE="auto";   MASQ_URL="" ;;
+    random)          MASQ_MODE="random"; MASQ_URL="" ;;
+    none|off|no|"")  MASQ_MODE="none";   MASQ_URL="" ;;
+    *)               MASQ_MODE="manual"; MASQ_URL="$1" ;;
+  esac
+}
+
 usage() {
   cat <<'EOF'
 Hysteria2 一键部署脚本
@@ -161,7 +173,7 @@ Hysteria2 一键部署脚本
   --password <密码>      认证密码，默认随机
   --obfs-password <密码> 混淆密码，默认随机
   --no-obfs              关闭 salamander 混淆
-  --masquerade <URL>     伪装站点，默认 https://www.bing.com/
+  --masquerade <值>      伪装站点：auto 自动探测(默认) / random 随机 / none 关闭 / <URL> 手动
   --bw-up <带宽>         服务端上行带宽，如 "100 mbps"
   --bw-down <带宽>       服务端下行带宽
   --no-tune              不写入内核调优
@@ -183,7 +195,11 @@ while [ $# -gt 0 ]; do
     --password)      PASSWORD="${2:-}"; shift 2 ;;
     --obfs-password) OBFS_PASSWORD="${2:-}"; shift 2 ;;
     --no-obfs)       USE_OBFS=0; shift ;;
-    --masquerade)    MASQ_URL="${2:-}"; shift 2 ;;
+    --masquerade)
+      if [ $# -lt 2 ] || [[ "${2:-}" == --* ]]; then
+        die "--masquerade 需要一个值：auto | random | none | <URL>"
+      fi
+      set_masq "$2"; shift 2 ;;
     --bw-up)         BW_UP="${2:-}"; shift 2 ;;
     --bw-down)       BW_DOWN="${2:-}"; shift 2 ;;
     --no-tune)       TUNE=0; shift ;;
@@ -196,7 +212,8 @@ while [ $# -gt 0 ]; do
 done
 
 # 通过 curl | bash 执行时，stdin 是脚本内容，交互输入需改走终端
-if [ "$ASSUME_YES" -eq 0 ] && [ "$ACTION" = "install" ] && [ ! -t 0 ] && [ -e /dev/tty ]; then
+# 用真实打开测试而非 [ -e ]：容器里 /dev/tty 可能存在但打不开
+if [ "$ASSUME_YES" -eq 0 ] && [ "$ACTION" = "install" ] && [ ! -t 0 ] && { : </dev/tty; } 2>/dev/null; then
   exec </dev/tty
 fi
 
@@ -228,6 +245,56 @@ detect_pubip() {
 }
 
 rand_hex() { openssl rand -hex "${1:-16}" 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' | cut -c1-32; }
+
+# ------------------------------ 伪装站点 ------------------------------
+# 候选池筛选标准：全球有 CDN、无反爬挑战、首页体积可控、内容中性（不涉及敏感题材）
+MASQ_POOL=(
+  "https://www.bing.com/"
+  "https://www.apple.com/"
+  "https://www.microsoft.com/"
+  "https://www.cloudflare.com/"
+  "https://www.baidu.com/"
+  "https://www.qq.com/"
+  "https://www.163.com/"
+)
+MASQ_UA="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+# 探测单个站点：可达且内容正常时输出「耗时秒 字节数」，否则返回非 0
+probe_masq() {
+  local url="$1" out code secs size
+  out="$(curl -sS -o /dev/null -L --max-time 6 --connect-timeout 4 \
+           -A "$MASQ_UA" -H 'Accept-Language: en-US,en;q=0.9' \
+           -w '%{http_code} %{time_total} %{size_download}' \
+           "$url" 2>/dev/null)" || return 1
+  read -r code secs size <<<"$out"
+  case "$code" in 2*|3*) ;; *) return 1 ;; esac
+  [ "${size:-0}" -ge 800 ] 2>/dev/null || return 1   # 过滤跳转页/空白页/挑战页
+  printf '%s %s\n' "$secs" "$size"
+}
+
+# 并行探测整个候选池，输出「耗时<TAB>URL」，只含成功项
+probe_masq_all() {
+  local dir url i=0
+  dir="$(mktemp -d)"
+  for url in "${MASQ_POOL[@]}"; do
+    i=$((i + 1))
+    ( r="$(probe_masq "$url")" && printf '%s\t%s\n' "${r%% *}" "$url" > "${dir}/${i}" ) &
+  done
+  wait || true
+  cat "${dir}"/* 2>/dev/null || true
+  rm -rf "$dir" 2>/dev/null || true
+}
+
+# 自动模式：选反代耗时最短的那个
+pick_masq_auto() {
+  probe_masq_all | awk -F'\t' 'BEGIN{b=-1} {if (b < 0 || $1+0 < b) {b=$1+0; u=$2}} END{if (b >= 0) print u}'
+}
+
+# 随机模式：不探测，直接抽一个
+pick_masq_random() {
+  printf '%s' "${MASQ_POOL[$((RANDOM % ${#MASQ_POOL[@]}))]}"
+}
+
 
 # ------------------------------ 安装二进制 ------------------------------
 get_version() {
@@ -330,13 +397,19 @@ write_config() {
       echo
     fi
 
-    echo "# 伪装站点：浏览器直接访问会看到这个站"
-    echo "masquerade:"
-    echo "  type: proxy"
-    echo "  proxy:"
-    echo "    url: ${MASQ_URL}"
-    echo "    rewriteHost: true"
-    echo
+    if [ "$MASQ_MODE" != "none" ] && [ -n "$MASQ_URL" ]; then
+      echo "# 伪装站点：浏览器直接访问端口会看到这个站"
+      echo "masquerade:"
+      echo "  type: proxy"
+      echo "  proxy:"
+      echo "    # rewriteHost 必须为 true，否则转发的是客户端 Host，目标站会返回 400/404"
+      echo "    rewriteHost: true"
+      echo "    url: ${MASQ_URL}"
+      echo
+    else
+      echo "# 未配置 masquerade：直接访问端口返回 404，不暴露任何指纹"
+      echo
+    fi
 
     echo "# QUIC 参数（默认值，大带宽机器可等比放大）"
     echo "quic:"
@@ -361,7 +434,7 @@ write_config() {
   } > "$tmpc"
 
   install -m 600 "$tmpc" "$HY2_CONF"
-  rm -f "$tmpc"
+  rm -f "$tmpc" 2>/dev/null || true
   ok "配置已写入 ${HY2_CONF}"
 }
 
@@ -516,6 +589,7 @@ print_info() {
   fi
   [ -n "${M_OBFS:-}" ] && printf " %-12s %s\n" "混淆" "salamander / ${M_OBFS}"
   [ -n "$pin" ] && printf " %-12s %s\n" "pinSHA256" "${pin}"
+  [ -n "${M_MASQ:-}" ] && printf " %-12s %s\n" "伪装站点" "${M_MASQ}"
   hr
   echo
   printf "${C_B}分享链接${C_0}\n"
@@ -650,7 +724,47 @@ collect_config() {
 
   # --- 6. 伪装 / 调优 ---
   step "6/6  伪装与调优"
-  ask "伪装站点 URL" MASQ_URL "$MASQ_URL"
+  echo "   ${C_D}伪装站点决定别人扫到你端口时看到什么页面${C_0}"
+
+  if [ "$MASQ_MODE_SET" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+    choose "伪装站点" MASQ_CHOICE \
+      "自动探测（并行测候选站，选最快的）" \
+      "随机选一个（不探测，装得更快）" \
+      "手动指定 URL" \
+      "关闭（直接访问端口返回 404）"
+    case "$MASQ_CHOICE" in
+      1) MASQ_MODE="auto" ;;
+      2) MASQ_MODE="random" ;;
+      3) MASQ_MODE="manual" ;;
+      4) MASQ_MODE="none" ;;
+    esac
+  fi
+
+  local picked=""
+  case "$MASQ_MODE" in
+    manual)
+      ask "伪装站点 URL" MASQ_URL "${MASQ_URL:-https://www.bing.com/}"
+      case "$MASQ_URL" in
+        http://*|https://*) ;;
+        *) die "伪装 URL 需以 http:// 或 https:// 开头" ;;
+      esac ;;
+    auto)
+      info "探测候选站点可用性（并行，最多约 6 秒）"
+      picked="$(pick_masq_auto)"
+      if [ -n "$picked" ]; then
+        MASQ_URL="$picked"
+        ok "自动选定：${MASQ_URL}"
+      else
+        MASQ_URL="https://www.bing.com/"
+        warn "候选站点全部不可达（VPS 出网受限？），回落到 ${MASQ_URL}"
+      fi ;;
+    random)
+      MASQ_URL="$(pick_masq_random)"
+      ok "随机选定：${MASQ_URL}" ;;
+    none)
+      info "已关闭伪装，直接访问端口会返回 404" ;;
+  esac
+
   confirm "写入内核调优（fq + BBR + UDP 缓冲）？" "y" && TUNE=1 || TUNE=0
 
   # --- 校验 ---
@@ -670,7 +784,7 @@ show_summary() {
   printf " %-12s %s\n" "证书"     "$([ "$MODE" = "acme" ] && echo "ACME 自动签发（${DOMAIN}）" || echo "自签（pinSHA256）")"
   printf " %-12s %s\n" "密码"     "${PASSWORD}"
   printf " %-12s %s\n" "混淆"     "$([ "$USE_OBFS" -eq 1 ] && echo "salamander / ${OBFS_PASSWORD}" || echo "关闭")"
-  printf " %-12s %s\n" "伪装站点" "${MASQ_URL}"
+  printf " %-12s %s\n" "伪装站点" "$([ "$MASQ_MODE" = "none" ] && echo "关闭（返回 404）" || echo "${MASQ_URL}")"
   printf " %-12s %s\n" "内核调优" "$([ "$TUNE" -eq 1 ] && echo "是" || echo "否")"
   hr
   echo
