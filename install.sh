@@ -6,7 +6,7 @@
 #           Alpine 3.18+（OpenRC）
 #  init 系统：systemd（主流发行版）/ OpenRC（Alpine、Gentoo）
 #  协议版本：Hysteria v2.13.x（自动拉取 GitHub 最新 release）
-#  脚本版本：1.0.1
+#  脚本版本：1.0.2
 #
 #  用法：
 #    bash install.sh                          # 交互式向导（推荐）
@@ -34,7 +34,7 @@ if [ -z "${BASH_VERSION:-}" ]; then
   exit 1
 fi
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 # ------------------------------ 常量与默认值 ------------------------------
 HY2_BIN="/usr/local/bin/hysteria"
@@ -62,6 +62,7 @@ MASQ_MODE_SET=0           # 是否已由命令行指定，指定后不再询问
 BW_UP=""
 BW_DOWN=""
 PINNED_VERSION=""
+SNI_OVERRIDE=""             # --sni：只影响分享链接里的 sni，不改服务端
 DL_VERSION=""               # 实际下载到的版本，二进制自报版本失败时兜底
 TUNE=1
 ASSUME_YES=0
@@ -252,6 +253,7 @@ Hysteria2 一键部署脚本（systemd / OpenRC）
   --obfs-password <密码> 混淆密码，默认随机
   --no-obfs              关闭 salamander 混淆
   --masquerade <值>      伪装站点：auto 自动探测(默认) / random 随机 / none 关闭 / <URL> 手动
+  --sni <域名>           分享链接里填的 SNI，默认服务器 IP（自签模式用域名做伪装）
   --bw-up <带宽>         服务端上行带宽，如 "100 mbps"
   --bw-down <带宽>       服务端下行带宽
   --no-tune              不写入内核调优
@@ -273,6 +275,7 @@ while [ $# -gt 0 ]; do
     --password)      PASSWORD="${2:-}"; shift 2 ;;
     --obfs-password) OBFS_PASSWORD="${2:-}"; shift 2 ;;
     --no-obfs)       USE_OBFS=0; shift ;;
+    --sni)           SNI_OVERRIDE="${2:-}"; shift 2 ;;
     --masquerade)
       if [ $# -lt 2 ] || [[ "${2:-}" == --* ]]; then
         die "--masquerade 需要一个值：auto | random | none | <URL>"
@@ -501,6 +504,14 @@ install_binary() {
 }
 
 # ------------------------------ 证书 ------------------------------
+# 证书 SHA256 指纹：hex 小写、无冒号。Hysteria 的 pinSHA256 要的就是这个格式，
+# base64 的 SPKI pin 会握手失败。info 时旧版 meta 里没有 M_PIN，用磁盘证书现算。
+cert_pin_of() {
+  [ -f "$1" ] || return 0
+  openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null \
+    | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f'
+}
+
 gen_selfsigned() {
   local san="$1" san_entry
   if is_ip "$san"; then san_entry="IP:${san}"; else san_entry="DNS:${san}"; fi
@@ -513,8 +524,7 @@ gen_selfsigned() {
     || die "证书生成失败（openssl 版本过低，需 1.1.1+）"
   chmod 600 "${HY2_DIR}/key.pem" "${HY2_DIR}/cert.pem"
 
-  CERT_PIN="$(openssl x509 -in "${HY2_DIR}/cert.pem" -noout -fingerprint -sha256 \
-              | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')"
+  CERT_PIN="$(cert_pin_of "${HY2_DIR}/cert.pem")"
   ok "证书已生成（有效期 10 年），pinSHA256: ${CERT_PIN}"
 }
 
@@ -752,6 +762,7 @@ save_meta() {
     printf 'M_PASSWORD=%q\n' "${M_PASSWORD:-}"
     printf 'M_OBFS=%q\n'     "${M_OBFS:-}"
     printf 'M_PIN=%q\n'      "${M_PIN:-}"
+    printf 'M_SNI=%q\n'      "${M_SNI:-}"
     printf 'M_VER=%q\n'      "${M_VER:-unknown}"
     printf 'M_MASQ=%q\n'     "${M_MASQ:-}"
   } > "$META"
@@ -778,11 +789,14 @@ uri_enc() {
 }
 
 build_uri() {
-  local host="$1" port="$2" pwd="$3" obfs="$4" sni="$5" insecure="$6" name="$7"
+  local host="$1" port="$2" pwd="$3" obfs="$4" sni="$5" insecure="$6" pin="$7" name="$8"
   local q="" out_host="$host"
   [[ "$host" == *:* ]] && [[ "$host" != \[*\] ]] && out_host="[${host}]"
   [ -n "$sni" ] && q="${q}&sni=$(uri_enc "$sni")"
   [ "$insecure" = "1" ] && q="${q}&insecure=1"
+  # 自签模式把指纹一起写进链接：insecure=1 只表示"不校验链"，
+  # 有 pinSHA256 才能挡住中间人；缺了它新链接看起来就和别的脚本不一样。
+  [ -n "$pin" ] && q="${q}&pinSHA256=${pin}"
   [ -n "$obfs" ] && q="${q}&obfs=salamander&obfs-password=$(uri_enc "$obfs")"
   q="${q#&}"
   [ -z "$q" ] && q="sni=$(uri_enc "$host")"
@@ -795,10 +809,14 @@ print_info() {
   if [ "${M_MODE:-}" = "acme" ]; then
     sni="${M_DOMAIN}"; insecure=0
   else
-    sni="$host"; insecure=1; pin="${M_PIN:-}"
+    # 默认 SNI 仍是服务器 IP（sniGuard 已关，随便填都能握手）；
+    # --sni 可以把链接里的 SNI 换成任意域名，让 ClientHello 更像正常访问。
+    sni="${SNI_OVERRIDE:-${M_SNI:-$host}}"; insecure=1
+    pin="${M_PIN:-}"
+    [ -z "$pin" ] && pin="$(cert_pin_of "${HY2_DIR}/cert.pem")"
   fi
 
-  uri="$(build_uri "$host" "$M_PORT" "$M_PASSWORD" "$M_OBFS" "$sni" "$insecure" "HY2-${host}")"
+  uri="$(build_uri "$host" "$M_PORT" "$M_PASSWORD" "$M_OBFS" "$sni" "$insecure" "$pin" "HY2-${host}")"
 
   # 旧版脚本写入的 M_VER 是 unknown（取首行的 bug），这时现场问一次二进制，
   # 免得用户为了看版本号去重装、把密码和证书一起换掉
@@ -1109,6 +1127,7 @@ do_install() {
   M_PASSWORD="$PASSWORD"
   if [ "$USE_OBFS" -eq 1 ]; then M_OBFS="$OBFS_PASSWORD"; else M_OBFS=""; fi
   M_PIN="${CERT_PIN:-}"
+  M_SNI="${SNI_OVERRIDE:-}"
   M_VER="$(get_version)"
   M_MASQ="$MASQ_URL"
   save_meta

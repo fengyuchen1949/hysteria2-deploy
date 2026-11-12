@@ -155,6 +155,7 @@ bash install.sh --version v2.13.0 --yes
 | `--obfs-password <密码>` | 混淆密码，默认随机 |
 | `--no-obfs` | 关闭 salamander 混淆 |
 | `--masquerade <值>` | 伪装站点：`auto` 自动探测（默认）/ `random` 随机 / `none` 关闭 / `<URL>` 手动指定 |
+| `--sni <域名>` | 只改分享链接里的 `sni`（默认填服务器 IP），自签模式可借真实域名伪装 ClientHello |
 | `--bw-up` / `--bw-down` | 服务端带宽，如 `"100 mbps"` |
 | `--no-tune` | 不写内核调优 |
 | `--version <vX.Y.Z>` | 指定 Hysteria 版本 |
@@ -231,7 +232,7 @@ bash install.sh --masquerade https://www.example.com/   # 手动
 **Hysteria2 分享链接**
 
 ```
-hysteria2://密码@YOUR_SERVER_IP:443/?sni=YOUR_SERVER_IP&insecure=1&obfs=salamander&obfs-password=xxx#HY2-YOUR_SERVER_IP
+hysteria2://密码@YOUR_SERVER_IP:443/?sni=YOUR_SERVER_IP&insecure=1&pinSHA256=<64位hex>&obfs=salamander&obfs-password=xxx#HY2-YOUR_SERVER_IP
 ```
 
 **Clash Meta / mihomo**
@@ -245,6 +246,7 @@ proxies:
     password: "xxx"
     sni: YOUR_SERVER_IP
     skip-cert-verify: true
+    fingerprint: "<64位hex>"
     obfs: salamander
     obfs-password: "xxx"
     up: "50 Mbps"
@@ -266,6 +268,21 @@ proxies:
   "down_mbps": 200
 }
 ```
+
+### 链接里的参数为什么和别人脚本的不一样
+
+不同一键脚本生成的 `hysteria2://` 链接长得不一样，是各自选的服务端参数不同，不是谁对谁错：
+
+| 参数 | 本脚本（自签模式） | 其它脚本常见写法 | 说明 |
+|---|---|---|---|
+| `sni` | 服务器 IP | 借一个真实域名（如 `www.amd.com`） | 自签 + `sniGuard: disable` 时服务端不校 SNI，填什么都能握手；填域名只是让 ClientHello 更像正常访问。想换成域名用 `--sni` |
+| `insecure=1` | 有 | 有 | 跳过证书链校验，自签证书必需 |
+| `pinSHA256` | 有（证书指纹 hex） | 有时有 | 固定证书指纹，能防中间人；比裸 `insecure=1` 安全 |
+| `obfs=salamander` | 有，`--no-obfs` 可关 | 常没有 | QUIC 载荷再套一层混淆，抗 QUIC 特征识别；客户端必须支持并填同一密码 |
+
+- 端口、密码、备注名每次安装都不同，正常
+- 旧客户端不认 `obfs` 时表现为超时或「密码错误」：升级客户端，或服务端 `--no-obfs` 重装
+- 只有 `insecure=1` 没有 `pinSHA256` 也能用，只是少一层防护；`bash install.sh info` 现在会带上指纹
 
 ## 管理
 
